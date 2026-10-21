@@ -208,8 +208,8 @@ def build_server(
             "Read-only; no approval needed. Start here to find a target."
         ),
     )
-    def list_apps() -> str:
-        apps = base_client.list_apps()
+    async def list_apps() -> str:
+        apps = await asyncio.to_thread(base_client.list_apps)
         lines = []
         for a in apps:
             flag = "running" if a["isRunning"] else "idle"
@@ -225,8 +225,8 @@ def build_server(
             "and title. Read-only; no approval needed."
         ),
     )
-    def list_windows() -> str:
-        return format_windows(base_client.list_windows())
+    async def list_windows() -> str:
+        return format_windows(await asyncio.to_thread(base_client.list_windows))
 
     @server.tool(
         title="Get window",
@@ -235,8 +235,8 @@ def build_server(
             "or a stale handle. Read-only."
         ),
     )
-    def get_window(window_id: int, app: str) -> str:
-        ref = base_client.get_window(window_id, app)
+    async def get_window(window_id: int, app: str) -> str:
+        ref = await asyncio.to_thread(base_client.get_window, window_id, app)
         return f"id={ref.id} app={ref.app} title={ref.title!r}"
 
     # -- observation -------------------------------------------------------
