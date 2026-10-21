@@ -111,6 +111,9 @@ class CuaClient:
         """
         self._t = transport
         self._on_approval = on_approval
+        # Window ids we have observed with a screenshot, so an
+        # element-targeted action is not refused for want of geometry.
+        self._observed: set[int] = set()
 
     def with_approval_hook(self, on_approval: Any) -> "CuaClient":
         """A sibling client sharing this transport, with a new approval hook.
@@ -118,7 +121,9 @@ class CuaClient:
         Use this per tool call so each call carries its own consent
         callback instead of mutating shared state.
         """
-        return CuaClient(self._t, on_approval=on_approval)
+        sibling = CuaClient(self._t, on_approval=on_approval)
+        sibling._observed = self._observed
+        return sibling
 
     # -- plumbing ----------------------------------------------------------
 
@@ -155,6 +160,10 @@ class CuaClient:
                     f"Computer Use was not approved to use "
                     f"{request.get('displayName') or request.get('app')}"
                 ) from exc
+            # Record the approval under the app id the helper itself asked
+            # about. The transport matches approvals by app identity, so a
+            # later window-targeted call -- which names the same app
+            # differently -- is covered by this one approval.
             approved = str(request.get("app") or app or "")
             self._t.approve(approved)
             return await asyncio.to_thread(
@@ -249,6 +258,8 @@ class CuaClient:
         raw = await self._act("get_window_state", params, app=window.app)
         if not isinstance(raw, dict):
             raise HelperError("helper did not return window state")
+        if include_screenshot and raw.get("screenshots"):
+            self._observed.add(int(window.id))
         return raw
 
     async def accessibility_tree(self, window: WindowRef) -> str:
@@ -265,8 +276,26 @@ class CuaClient:
     # -- actions -----------------------------------------------------------
 
     async def launch_app(self, app: str) -> None:
-        """Launch an app by id, or by explicit ``.exe`` path."""
-        await self._act("launch_app", {"app": app}, app=app, timeout=45.0)
+        """Launch an app by id, or by explicit ``.exe`` path.
+
+        The Windows helper sometimes reports ``accessibility window-opened
+        handler did not become ready`` on a cold start: the app launches,
+        but the helper's UIA watcher is not wired up in time to notice the
+        new window. The app is running by then, so the helper is the thing
+        that is late. One retry settles it.
+        """
+        last: Exception | None = None
+        for attempt in range(2):
+            try:
+                await self._act("launch_app", {"app": app}, app=app, timeout=45.0)
+                return
+            except HelperError as exc:
+                last = exc
+                if attempt == 0 and "window-opened handler" in str(exc):
+                    continue
+                raise
+        if last is not None:  # pragma: no cover - the loop always returns or raises
+            raise last
 
     async def activate_window(self, window: WindowRef) -> None:
         """Bring a window to the foreground.
@@ -293,28 +322,138 @@ class CuaClient:
         """
         params: dict[str, Any] = {"window": window.to_helper()}
         if element_index is not None:
-            params["element_index"] = int(element_index)
-        else:
-            if x is None or y is None:
-                raise ValueError("click needs either element_index or both x and y")
-            params["x"] = int(x)
-            params["y"] = int(y)
+            # The Windows helper's `click` method requires x/y; it rejects
+            # an element-targeted click. Route to `click_element`, which
+            # actuates the control through UI Automation.
+            await self.click_element(
+                window,
+                element_index=element_index,
+                mouse_button=mouse_button,
+                click_count=click_count,
+            )
+            return
+        if x is None or y is None:
+            raise ValueError("click needs either element_index or both x and y")
+        params["x"] = int(x)
+        params["y"] = int(y)
         params["mouse_button"] = mouse_button
         params["click_count"] = int(click_count)
         if screenshot_id:
             params["screenshotId"] = screenshot_id
         await self._act("click", params, app=window.app)
 
-    async def type_text(self, window: WindowRef, text: str) -> None:
-        """Type literal text into a window's current focus."""
+    async def click_element(
+        self,
+        window: WindowRef,
+        element_index: int,
+        mouse_button: str = "left",
+        click_count: int = 1,
+    ) -> None:
+        """Click an element by its index in the accessibility tree.
+
+        The Windows helper's ``click`` method requires window-relative
+        coordinates, so an element-targeted click goes through
+        ``click_element`` instead.
+
+        The helper also refuses an element-targeted action unless the
+        window has been observed with a screenshot -- it needs the
+        captured geometry to route the input. This method takes that
+        observation itself when the caller has not already made one.
+        """
+        await self._ensure_observed(window)
+        params: dict[str, Any] = {
+            "window": window.to_helper(),
+            "element_index": int(element_index),
+            "mouse_button": mouse_button,
+            "click_count": int(click_count),
+        }
+        await self._act_on_element(window, "click_element", params)
+
+    async def _ensure_observed(self, window: WindowRef) -> None:
+        """Observe the window with a screenshot, if it has not been observed.
+
+        The helper tracks the last observation per window and rejects an
+        element-targeted action with "coordinate input geometry is
+        unavailable" when that observation had no screenshot. Re-observing
+        is cheap relative to a failed action, and it keeps the caller from
+        having to know this rule.
+        """
+        if window.id in self._observed:
+            return
+        await self.get_window_state(
+            window, include_screenshot=True, include_text=False
+        )
+
+    async def _act_on_element(
+        self,
+        window: WindowRef,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        """Run an element-targeted action, re-observing if the helper says so.
+
+        The helper's observation of a window can go stale -- the window
+        moved, resized, or the observation aged out -- and it then refuses
+        the action with "coordinate input geometry is unavailable" or
+        "call get_window_state before using this window". A fresh
+        observation fixes both, and the action is worth retrying once
+        because the refusal says nothing about the action itself.
+        """
+        await self._ensure_observed(window)
+        try:
+            await self._act(method, params, app=window.app)
+        except HelperError as exc:
+            message = str(exc)
+            stale = "coordinate input geometry is unavailable" in message or (
+                "call get_window_state before using this window" in message
+            )
+            if not stale:
+                raise
+            self._observed.discard(int(window.id))
+            await self._ensure_observed(window)
+            await self._act(method, params, app=window.app)
+
+    async def type_text(
+        self,
+        window: WindowRef,
+        text: str,
+        element_index: int | None = None,
+    ) -> None:
+        """Type literal text into a window.
+
+        The helper's ``type_text`` delivers keystrokes to whatever control
+        currently holds focus in the target window. If nothing holds focus
+        there, the characters are typed into the void and are lost -- the
+        call reports success and the target is unchanged. That silent
+        failure is the single most dangerous thing an agent can hit here,
+        so pass ``element_index`` to make the target explicit: the element
+        is clicked first to place the caret, then the text is typed.
+
+        With no ``element_index`` the call types into the window's existing
+        focus, which is right when the caller has just clicked something.
+        """
+        if element_index is not None:
+            await self.click_element(window, element_index=element_index)
         await self._act(
             "type_text", {"window": window.to_helper(), "text": text}, app=window.app
         )
 
-    async def press_key(self, window: WindowRef, key: str) -> None:
-        """Press a key chord, e.g. ``Control_L+a`` or ``Return``."""
+    async def press_key(
+        self,
+        window: WindowRef,
+        key: str,
+        element_index: int | None = None,
+    ) -> None:
+        """Press a key chord, e.g. ``Control_L+a`` or ``Return``.
+
+        Like :meth:`type_text`, the key goes to the window's current focus.
+        Pass ``element_index`` to click that element first, so the chord
+        lands where it was meant to.
+        """
         if not key or not key.strip():
             raise ValueError("key is required")
+        if element_index is not None:
+            await self.click_element(window, element_index=element_index)
         await self._act(
             "press_key", {"window": window.to_helper(), "key": key}, app=window.app
         )
@@ -366,27 +505,31 @@ class CuaClient:
         await self._act("drag", params, app=window.app)
 
     async def set_value(self, window: WindowRef, element_index: int, value: str) -> None:
-        """Replace the value of an editable element."""
-        await self._act(
+        """Replace the value of an editable element.
+
+        This one needs no focused control, so it is the reliable way to
+        fill a field. An empty value clears it.
+        """
+        await self._act_on_element(
+            window,
             "set_value",
             {
                 "window": window.to_helper(),
                 "element_index": int(element_index),
                 "value": value,
             },
-            app=window.app,
         )
 
     async def perform_secondary_action(
         self, window: WindowRef, element_index: int, action: str
     ) -> None:
         """Invoke a secondary accessibility action, e.g. ``Expand``."""
-        await self._act(
+        await self._act_on_element(
+            window,
             "perform_secondary_action",
             {
                 "window": window.to_helper(),
                 "element_index": int(element_index),
                 "action": action,
             },
-            app=window.app,
         )

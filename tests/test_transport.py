@@ -76,6 +76,53 @@ def test_approval_of_one_app_does_not_approve_another():
     assert t.approved_apps() == ["app.one"]
 
 
+def test_approval_covers_the_process_path_form_of_the_same_app():
+    """A window names its app by process path; launch names it by exe name.
+
+    The helper asks to approve ``charmap.exe`` but a window-targeted call
+    carries ``process:C:\\Windows\\System32\\charmap.exe``. One approval
+    must cover both, or the user is re-prompted on every call.
+    """
+    t = make_transport(lambda req: None)
+    t.approve("charmap.exe")
+
+    path_form = r"process:C:\Windows\System32\charmap.exe"
+    assert t.is_approved(path_form)
+    meta = t._meta_for(path_form)
+    assert meta[APPROVED_APP_META_KEY] == "charmap.exe"
+
+
+def test_approval_covers_the_process_path_form_in_either_direction():
+    """Approving the process-path form also covers the bare exe name."""
+    t = make_transport(lambda req: None)
+    t.approve(r"process:C:\Windows\System32\charmap.exe")
+
+    assert t.is_approved("charmap.exe")
+    assert t.is_approved("CHARMAP.EXE")
+    assert t._meta_for("charmap.exe")[APPROVED_APP_META_KEY] == (
+        r"process:C:\Windows\System32\charmap.exe"
+    )
+
+
+def test_approval_does_not_leak_across_different_apps():
+    """Two different exes are two different apps, even in path form."""
+    t = make_transport(lambda req: None)
+    t.approve("charmap.exe")
+    assert not t.is_approved(r"process:C:\Windows\System32\notepad.exe")
+    assert APPROVED_APP_META_KEY not in t._meta_for(
+        r"process:C:\Windows\System32\notepad.exe"
+    )
+
+
+def test_packaged_app_ids_are_left_alone():
+    """Store apps share one id across both call forms; do not rewrite it."""
+    t = make_transport(lambda req: None)
+    app = "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"
+    t.approve(app)
+    assert t.is_approved(app)
+    assert t._meta_for(app)[APPROVED_APP_META_KEY] == app
+
+
 def test_approval_required_is_raised_for_approval_frames():
     req = {
         "app": "app.one",

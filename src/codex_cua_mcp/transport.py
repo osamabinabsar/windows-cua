@@ -373,16 +373,62 @@ class HelperTransport:
     def approved_apps(self) -> list[str]:
         return sorted(self._approved_apps)
 
+    @staticmethod
+    def _app_identity(app: str | None) -> str:
+        """Reduce an app id to the identity the helper approves by.
+
+        The helper names an app in two different ways depending on the call:
+        ``launch_app`` takes a bare executable name (``charmap.exe``), while
+        window-targeted calls carry the window's own app id, which for a
+        non-packaged app is a process path
+        (``process:C:\\Windows\\System32\\charmap.exe``). They are the same
+        app, and an approval for one must cover the other -- otherwise the
+        user is asked to approve the same app again on every call.
+
+        Packaged apps (Store apps) already share one id across both forms
+        (``Microsoft.WindowsNotepad_8wekyb3d8bbwe!App``), so only the
+        process-path form needs normalising.
+        """
+        if not app:
+            return ""
+        if app.lower().startswith("process:"):
+            return os.path.basename(app.split(":", 1)[1]).lower()
+        # A bare executable name is a filename, and Windows filenames are
+        # case-insensitive. A packaged app id is not a filename, so it is
+        # left exactly as given.
+        if app.lower().endswith(".exe"):
+            return app.lower()
+        return app
+
+    def is_approved(self, app: str | None) -> bool:
+        """Whether ``app`` (in any of its id forms) has been approved."""
+        identity = self._app_identity(app)
+        if not identity:
+            return False
+        return any(
+            self._app_identity(approved) == identity
+            for approved in self._approved_apps
+        )
+
     def _meta_for(self, app: str | None) -> dict[str, Any]:
         """Build the meta block for a request.
 
         The approved-app key is only sent for an app the user has actually
         approved through :meth:`approve`. The request-budget key is always
         sent so the helper has headroom for slow UIA calls.
+
+        The key carries the *approved* spelling of the app id, not the one
+        the caller happened to use, because the helper matches it against
+        its own canonical id.
         """
         meta: dict[str, Any] = {REQUEST_BUDGET_META_KEY: int(self.timeout * 1000)}
-        if app and app in self._approved_apps:
-            meta[APPROVED_APP_META_KEY] = app
+        if not app:
+            return meta
+        identity = self._app_identity(app)
+        for approved in self._approved_apps:
+            if self._app_identity(approved) == identity:
+                meta[APPROVED_APP_META_KEY] = approved
+                break
         return meta
 
     # -- request -----------------------------------------------------------

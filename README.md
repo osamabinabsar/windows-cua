@@ -165,19 +165,34 @@ uv run --project <path> python -m codex_cua_mcp.server
 | `get_window` | Rehydrate a window by id after a lost binding. |
 | `get_window_state` | Accessibility tree (with element indexes) and/or screenshot. |
 | `read_accessibility_tree` | Just the tree text — cheaper than a full state read. |
-| `click` | Click an element by index, or at window-relative coordinates. |
-| `type_text` | Type literal text into the window's focus. |
-| `press_key` | Key or chord (`Return`, `Control_L+a`, …). |
+| `click` | Click at window-relative coordinates. |
+| `click_element` | Click an element by index, via UI Automation. **Prefer this.** |
+| `type_text` | Type literal text. Pass `element_index` to say where it goes. |
+| `press_key` | Key or chord (`Return`, `Control_L+a`, …). Also takes `element_index`. |
 | `scroll` | Scroll from a window-relative point. |
 | `drag` | Drag between two window-relative points. |
-| `set_value` | Replace an editable element's value by index. |
+| `set_value` | Replace an editable element's value by index. Empty clears it. |
 | `perform_secondary_action` | `Expand`, `Collapse`, `Raise`, `Scroll Up`, … |
 | `launch_app` | Launch an app by id or `.exe` path. |
 | `activate_window` | **The only tool that takes focus.** Explicit escape hatch. |
-| `status` | Which binaries are in use, what is approved. |
+| `status` | Which binaries are in use, what is approved, helper log. |
 
 Every action except `activate_window` leaves your foreground window, your
 focus, and your mouse cursor exactly where they were.
+
+### Where the text goes
+
+`type_text` and `press_key` send keystrokes to the control that holds focus
+in the target window. **If nothing holds focus there, the characters are
+lost and the call still reports success.** So always pass `element_index`:
+
+```
+type_text(text="hello", element_index=3)   # clicks element 3, then types
+set_value(element_index=3, value="hello")   # no focus needed — the reliable one
+```
+
+`set_value` with an empty value clears the field. On Windows, `click`
+needs coordinates and `click_element` is the element-targeted path.
 
 ---
 
@@ -212,7 +227,7 @@ once, re-observe.
 ```
 1. list_apps              -> find the app, get its window id
 2. get_window_state       -> read the tree, note element indexes
-3. click(element_index=…) -> exactly one action
+3. click_element(index=…) -> exactly one action
 4. get_window_state       -> verify what changed
 ```
 
@@ -227,6 +242,25 @@ src/codex_cua_mcp/
   server.py      MCP surface + elicitation-based approval
 scripts/         protocol probes and a smoke test
 ```
+
+---
+
+## Checking the helper
+
+Codex ships a new helper build now and then, and the helper's
+undocumented behaviours are the fragile part of this project. When it
+updates, re-check that the workarounds still hold:
+
+```bash
+.venv\Scripts\python.exe scripts\probe_helpers.py
+```
+
+It runs eight checks against the live helper and reports pass/fail for
+each. The target is Character Map, which cannot hold a user document, so
+running it cannot damage your work.
+
+See [the architecture doc](docs/architecture.md) for what the three
+workarounds are and why each is needed.
 
 ## Licence
 

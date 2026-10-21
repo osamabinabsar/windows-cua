@@ -83,15 +83,24 @@ async def test_click_requires_element_or_coords():
         await c.click(ref, x=5)
 
 
-async def test_click_passes_element_index():
+async def test_click_with_element_index_routes_to_click_element():
+    """On Windows the helper's `click` requires x/y.
+
+    It rejects an element-targeted click outright ("parse click params:
+    missing field 'x'"), so the element path is a separate method.
+    """
     t = RecordingTransport()
     c = CuaClient(t)
     await c.click(WindowRef(app="a", id=1), element_index=7)
     method, params, app = t.calls[-1]
-    assert method == "click"
+    assert method == "click_element"
     assert params["element_index"] == 7
     assert params["click_count"] == 1
     assert params["mouse_button"] == "left"
+    # It observed the window with a screenshot first, so the helper has
+    # the geometry it needs to route the input.
+    assert t.calls[0][0] == "get_window_state"
+    assert t.calls[0][1]["include_screenshot"] is True
 
 
 async def test_press_key_requires_key():

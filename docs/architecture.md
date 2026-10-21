@@ -54,7 +54,7 @@ equivalent concept.
  ┌──────────────┐   MCP/stdio  ┌─────────────────┐   JSON-RPC  ┌──────────────────┐
  │ Claude Code  │─────────────▶│  codex-cua-mcp  │───stdio────▶│ codex-computer-  │
  │ OpenCode     │              │                 │             │ use.exe          │
- │ Codex / etc  │◀─────────────│  15 MCP tools   │◀──stdio────│ (local, no net)  │
+ │ Codex / etc  │◀─────────────│  16 MCP tools   │◀──stdio────│ (local, no net)  │
  └──────────────┘   responses  └─────────────────┘             └──────────────────┘
                                           │                             │
                                    elicitation │                  UI Automation
@@ -136,7 +136,7 @@ record the approval and retry.
 
 ### `server.py` — the MCP surface
 
-Registers 15 tools and implements the approval prompt as an MCP
+Registers 16 tools and implements the approval prompt as an MCP
 **elicitation** (`Context.elicit`), so the harness asks the user and the
 user's answer is what authorises the action.
 
@@ -167,6 +167,36 @@ Methods, with the parameter shapes the helper expects:
 `window` is always `{"app": "<canonical app id>", "id": <int>}`. The `id`
 is opaque and only valid for windows returned by a prior call.
 
+### Three behaviours the helper does not advertise
+
+These were found by probing the live Windows binary, not by reading the
+type definitions. Each one has bitten a working client, so each has a
+defensive wrapper in `client.py`.
+
+**1. On Windows, `click` requires `x` and `y`.** The type definitions
+allow `element_index` in place of coordinates, but the Windows helper
+rejects that with `parse click params: missing field 'x'`. The
+element-targeted path is a separate method, `click_element`, which
+actuates the control through UI Automation and needs no coordinates at
+all. `CuaClient.click` therefore routes to `click_element` whenever it
+is given an `element_index`.
+
+**2. An element-targeted action needs a prior observation *with a
+screenshot*.** Without one the helper refuses with `coordinate input
+geometry is unavailable`, or `call get_window_state before using this
+window`. The captured geometry is what lets it route the input.
+`CuaClient._ensure_observed` re-observes the window with a screenshot
+when the caller has not already done so.
+
+**3. `type_text` and `press_key` go to whatever holds focus — and
+silently vanish if nothing does.** The helper reports success either
+way. Measured against Character Map: after `type_text "0042"`, the field
+read empty unless the field had been clicked first. This is the most
+dangerous of the three, because the failure is invisible. Both methods
+now take an optional `element_index` that clicks the target first, and
+`set_value` — which needs no focus at all — is the reliable way to fill a
+field. An empty `set_value` clears it.
+
 ## Constraints worth knowing
 
 - **Element indexes are only valid for the observation that produced them.**
@@ -180,6 +210,17 @@ is opaque and only valid for windows returned by a prior call.
 - **The Escape key still stops everything.** The helper watches for a
   physical Escape press and aborts the turn. That behaviour is inherited
   and is deliberately not overridden.
+- **An app is named two ways, and both must be approved.** `launch_app`
+  takes a bare executable name (`charmap.exe`); window-targeted calls
+  carry the window's own app id, which for a non-packaged app is a
+  process path (`process:C:\Windows\System32\charmap.exe`). The helper
+  treats those as different apps and would ask for consent again on
+  every call. `HelperTransport._app_identity` reduces both to the
+  executable name, so one approval covers the session.
+- **Windows 11 Notepad is single-instance with tabs.** A "new" Notepad
+  can share a window — and a tab — with the document the user already
+  has open. Never point a test or a bulk action at Notepad; use an app
+  that cannot hold a user document.
 
 ## Upstream
 

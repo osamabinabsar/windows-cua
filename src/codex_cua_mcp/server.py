@@ -66,6 +66,13 @@ Element indexes come from `get_window_state`'s accessibility tree. Pass one
 as `element_index` instead of coordinates when the target is a known
 control.
 
+WHERE THE TEXT GOES
+`type_text` and `press_key` deliver keystrokes to the control that holds
+focus in the target window. If nothing holds focus there, the characters
+are lost and the call still reports success -- always pass
+`element_index` so the control is clicked first. `set_value` needs no
+focus at all, so prefer it for filling a field; an empty value clears it.
+
 APPROVAL
 The first action against an app asks you to approve it. The request goes to
 the client as an elicitation, so you see it and decide. Approvals persist
@@ -304,9 +311,10 @@ def build_server(
     @server.tool(
         title="Click",
         description=(
-            "Click in a target window, either on an accessibility element "
-            "(element_index from a window state read) or at window-relative "
-            "coordinates. The window is NOT brought to the foreground."
+            "Click at window-relative coordinates in a target window. The "
+            "window is NOT brought to the foreground. To click an element "
+            "you have an index for, use `click_element` instead -- it "
+            "actuates the control directly and needs no coordinates."
         ),
     )
     async def click(
@@ -336,35 +344,83 @@ def build_server(
         return f"clicked {target} in window {window_id}"
 
     @server.tool(
-        title="Type text",
+        title="Click element",
         description=(
-            "Type literal text into the target window's current focus. "
-            "Re-read the window state first to confirm focus is right. "
-            "Use press_key for Enter, Tab, arrows, and shortcuts."
+            "Click an element by its index in the accessibility tree, "
+            "actuated through UI Automation. Prefer this over `click` when "
+            "you have an element index: the Windows helper's `click` method "
+            "needs window-relative coordinates, while this one needs "
+            "neither. The window is NOT brought to the foreground."
         ),
     )
-    async def type_text(ctx: Context, app: str, window_id: int, text: str) -> str:
+    async def click_element(
+        ctx: Context,
+        app: str,
+        window_id: int,
+        element_index: int,
+        mouse_button: str = "left",
+        click_count: int = 1,
+    ) -> str:
         ref = _window_ref(app, window_id)
         client = _client_for(ctx)
         try:
-            await client.type_text(ref, text)
+            await client.click_element(
+                ref,
+                element_index=element_index,
+                mouse_button=mouse_button,
+                click_count=click_count,
+            )
+        except HelperError as exc:
+            return f"click_element failed: {_err(exc)}"
+        return f"clicked element {element_index} in window {window_id}"
+
+    @server.tool(
+        title="Type text",
+        description=(
+            "Type literal text into a target window. Pass `element_index` "
+            "to say which control the text belongs in: the element is "
+            "clicked first, then the text is typed. Without it the text "
+            "goes to whatever currently holds focus, and if nothing does "
+            "the characters are silently lost -- the call still reports "
+            "success. Use press_key for Enter, Tab, arrows, and shortcuts."
+        ),
+    )
+    async def type_text(
+        ctx: Context,
+        app: str,
+        window_id: int,
+        text: str,
+        element_index: int | None = None,
+    ) -> str:
+        ref = _window_ref(app, window_id)
+        client = _client_for(ctx)
+        try:
+            await client.type_text(ref, text, element_index=element_index)
         except HelperError as exc:
             return f"type failed: {_err(exc)}"
-        return f"typed {len(text)} chars into window {window_id}"
+        where = f" element {element_index}" if element_index is not None else ""
+        return f"typed {len(text)} chars into{where or ''} window {window_id}"
 
     @server.tool(
         title="Press key",
         description=(
             "Press a key or chord in the target window, using X keysym-style "
             "names: 'Return', 'Tab', 'Escape', 'Control_L+a', "
-            "'Control_L+Shift_L+period'."
+            "'Control_L+Shift_L+period'. Pass `element_index` to click that "
+            "element first, so the chord lands on it."
         ),
     )
-    async def press_key(ctx: Context, app: str, window_id: int, key: str) -> str:
+    async def press_key(
+        ctx: Context,
+        app: str,
+        window_id: int,
+        key: str,
+        element_index: int | None = None,
+    ) -> str:
         ref = _window_ref(app, window_id)
         client = _client_for(ctx)
         try:
-            await client.press_key(ref, key)
+            await client.press_key(ref, key, element_index=element_index)
         except HelperError as exc:
             return f"press_key failed: {_err(exc)}"
         return f"pressed {key!r} in window {window_id}"
@@ -422,7 +478,9 @@ def build_server(
         title="Set value",
         description=(
             "Replace the value of an editable element, addressed by the "
-            "element_index from a window state read."
+            "element_index from a window state read. Works without focus, "
+            "and an empty value clears the field -- so this is the reliable "
+            "way to type into a control that type_text cannot reach."
         ),
     )
     async def set_value(
@@ -478,19 +536,23 @@ def build_server(
         title="Server status",
         description=(
             "Report which helper binary and codex CLI are in use, whether "
-            "the helper is running, and which apps are approved so far."
+            "the helper is running, which apps are approved so far, and "
+            "the helper's own recent log lines."
         ),
     )
     def status() -> str:
-        return "\n".join(
-            [
-                f"helper      : {transport.helper_path}",
-                f"codex cli   : {transport.codex_cli_path or '(not found)'}",
-                f"alive       : {transport.is_alive()}",
-                f"approved    : {', '.join(transport.approved_apps()) or '(none)'}",
-                f"auto_approve: {auto_approve}",
-            ]
-        )
+        lines = [
+            f"helper      : {transport.helper_path}",
+            f"codex cli   : {transport.codex_cli_path or '(not found)'}",
+            f"alive       : {transport.is_alive()}",
+            f"approved    : {', '.join(transport.approved_apps()) or '(none)'}",
+            f"auto_approve: {auto_approve}",
+        ]
+        tail = transport.stderr_tail(limit=10)
+        if tail:
+            lines.append("helper log  :")
+            lines.extend(f"    {line}" for line in tail)
+        return "\n".join(lines)
 
     server._cua_transport = transport  # type: ignore[attr-defined]
     return server
