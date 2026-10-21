@@ -73,20 +73,20 @@ def test_list_windows_parses_wrapped_object():
     assert len(c.list_windows()) == 1
 
 
-def test_click_requires_element_or_coords():
+async def test_click_requires_element_or_coords():
     t = RecordingTransport()
     c = CuaClient(t)
     ref = WindowRef(app="a", id=1)
     with pytest.raises(ValueError):
-        c.click(ref)
+        await c.click(ref)
     with pytest.raises(ValueError):
-        c.click(ref, x=5)
+        await c.click(ref, x=5)
 
 
-def test_click_passes_element_index():
+async def test_click_passes_element_index():
     t = RecordingTransport()
     c = CuaClient(t)
-    c.click(WindowRef(app="a", id=1), element_index=7)
+    await c.click(WindowRef(app="a", id=1), element_index=7)
     method, params, app = t.calls[-1]
     assert method == "click"
     assert params["element_index"] == 7
@@ -94,17 +94,17 @@ def test_click_passes_element_index():
     assert params["mouse_button"] == "left"
 
 
-def test_press_key_requires_key():
+async def test_press_key_requires_key():
     t = RecordingTransport()
     c = CuaClient(t)
     with pytest.raises(ValueError):
-        c.press_key(WindowRef(app="a", id=1), "  ")
+        await c.press_key(WindowRef(app="a", id=1), "  ")
 
 
-def test_scroll_shape():
+async def test_scroll_shape():
     t = RecordingTransport()
     c = CuaClient(t)
-    c.scroll(WindowRef(app="a", id=1), 10, 20, scroll_y=600)
+    await c.scroll(WindowRef(app="a", id=1), 10, 20, scroll_y=600)
     method, params, _ = t.calls[-1]
     assert method == "scroll"
     assert params == {
@@ -116,7 +116,7 @@ def test_scroll_shape():
     }
 
 
-def test_approval_flow_retries_with_approved_app():
+async def test_approval_flow_retries_with_approved_app():
     t = RecordingTransport(approval_app="app.one")
     seen: list[dict] = []
 
@@ -125,7 +125,7 @@ def test_approval_flow_retries_with_approved_app():
         return True
 
     c = CuaClient(t, on_approval=on_approval)
-    c.click(WindowRef(app="app.one", id=1), x=1, y=2)
+    await c.click(WindowRef(app="app.one", id=1), x=1, y=2)
 
     assert len(seen) == 1
     # Two calls: the first without approval, the retry carrying the app id.
@@ -135,19 +135,19 @@ def test_approval_flow_retries_with_approved_app():
     assert "app.one" in t.approved_apps()
 
 
-def test_approval_denial_stops_the_action():
+async def test_approval_denial_stops_the_action():
     t = RecordingTransport(approval_app="app.one")
     c = CuaClient(t, on_approval=lambda r: False)
     with pytest.raises(HelperError):
-        c.click(WindowRef(app="app.one", id=1), x=1, y=2)
+        await c.click(WindowRef(app="app.one", id=1), x=1, y=2)
     assert len(t.calls) == 1
 
 
-def test_approval_required_propagates_without_handler():
+async def test_approval_required_propagates_without_handler():
     t = RecordingTransport(approval_app="app.one")
     c = CuaClient(t)
     with pytest.raises(ApprovalRequired):
-        c.click(WindowRef(app="app.one", id=1), x=1, y=2)
+        await c.click(WindowRef(app="app.one", id=1), x=1, y=2)
 
 
 def test_reads_never_trigger_approval():
@@ -158,10 +158,10 @@ def test_reads_never_trigger_approval():
     assert len(t.calls) == 2
 
 
-def test_launch_app_passes_app_name():
+async def test_launch_app_passes_app_name():
     t = RecordingTransport()
     c = CuaClient(t)
-    c.launch_app("notepad")
+    await c.launch_app("notepad")
     method, params, app = t.calls[-1]
     assert method == "launch_app"
     assert params["app"] == "notepad"

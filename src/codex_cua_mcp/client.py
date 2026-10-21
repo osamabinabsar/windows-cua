@@ -23,6 +23,8 @@ Terminology
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -83,6 +85,11 @@ class CuaClient:
     approved, the caller-supplied ``on_approval`` hook is invoked to obtain
     real user consent, and only then is the request retried with the
     approved-app meta key.
+
+    The client is cheap to build -- it is a thin wrapper over the shared
+    transport -- so a server can make one per tool call, each bound to that
+    call's own approval hook. That keeps concurrent tool calls from
+    trampling each other's consent state.
     """
 
     def __init__(
@@ -96,13 +103,22 @@ class CuaClient:
         transport:
             The helper transport.
         on_approval:
-            Optional callable ``(request: dict) -> bool``. Receives the
-            helper's approval request and returns True to allow the app.
-            When absent, actions against unapproved apps raise
-            :class:`ApprovalRequired` instead of being silently approved.
+            Optional callable ``(request: dict) -> bool`` (sync or async).
+            Receives the helper's approval request and returns True to
+            allow the app. When absent, actions against unapproved apps
+            raise :class:`ApprovalRequired` instead of being silently
+            approved.
         """
         self._t = transport
         self._on_approval = on_approval
+
+    def with_approval_hook(self, on_approval: Any) -> "CuaClient":
+        """A sibling client sharing this transport, with a new approval hook.
+
+        Use this per tool call so each call carries its own consent
+        callback instead of mutating shared state.
+        """
+        return CuaClient(self._t, on_approval=on_approval)
 
     # -- plumbing ----------------------------------------------------------
 
@@ -110,7 +126,7 @@ class CuaClient:
     def transport(self) -> HelperTransport:
         return self._t
 
-    def _act(
+    async def _act(
         self,
         method: str,
         params: dict[str, Any] | None = None,
@@ -124,19 +140,29 @@ class CuaClient:
         user has actually approved that app.
         """
         try:
-            return self._t.request(method, params, timeout=timeout, approved_app=app)
+            return await asyncio.to_thread(
+                self._t.request, method, params, timeout=timeout, approved_app=app
+            )
         except ApprovalRequired as exc:
             request = exc.request
             if self._on_approval is None:
                 raise
-            if not self._on_approval(request):
+            allowed = self._on_approval(request)
+            if inspect.isawaitable(allowed):
+                allowed = await allowed
+            if not allowed:
                 raise HelperError(
                     f"Computer Use was not approved to use "
                     f"{request.get('displayName') or request.get('app')}"
                 ) from exc
-            self._t.approve(str(request.get("app") or app or ""))
-            return self._t.request(
-                method, params, timeout=timeout, approved_app=str(request.get("app") or app or "")
+            approved = str(request.get("app") or app or "")
+            self._t.approve(approved)
+            return await asyncio.to_thread(
+                self._t.request,
+                method,
+                params,
+                timeout=timeout,
+                approved_app=approved,
             )
 
     def _read(self, method: str, params: dict[str, Any] | None = None) -> Any:
@@ -202,7 +228,7 @@ class CuaClient:
 
     # -- observation -------------------------------------------------------
 
-    def get_window_state(
+    async def get_window_state(
         self,
         window: WindowRef,
         include_screenshot: bool = False,
@@ -220,14 +246,16 @@ class CuaClient:
             "include_screenshot": bool(include_screenshot),
             "include_text": bool(include_text),
         }
-        raw = self._act("get_window_state", params, app=window.app)
+        raw = await self._act("get_window_state", params, app=window.app)
         if not isinstance(raw, dict):
             raise HelperError("helper did not return window state")
         return raw
 
-    def accessibility_tree(self, window: WindowRef) -> str:
+    async def accessibility_tree(self, window: WindowRef) -> str:
         """The formatted accessibility tree text for a window."""
-        state = self.get_window_state(window, include_screenshot=False, include_text=True)
+        state = await self.get_window_state(
+            window, include_screenshot=False, include_text=True
+        )
         acc = state.get("accessibility")
         if not isinstance(acc, dict):
             return ""
@@ -236,19 +264,19 @@ class CuaClient:
 
     # -- actions -----------------------------------------------------------
 
-    def launch_app(self, app: str) -> None:
+    async def launch_app(self, app: str) -> None:
         """Launch an app by id, or by explicit ``.exe`` path."""
-        self._act("launch_app", {"app": app}, app=app, timeout=45.0)
+        await self._act("launch_app", {"app": app}, app=app, timeout=45.0)
 
-    def activate_window(self, window: WindowRef) -> None:
+    async def activate_window(self, window: WindowRef) -> None:
         """Bring a window to the foreground.
 
         This is the one action that *does* take focus. It is an explicit
         escape hatch -- every other action leaves the user's focus alone.
         """
-        self._act("activate_window", {"window": window.to_helper()}, app=window.app)
+        await self._act("activate_window", {"window": window.to_helper()}, app=window.app)
 
-    def click(
+    async def click(
         self,
         window: WindowRef,
         x: int | None = None,
@@ -275,19 +303,23 @@ class CuaClient:
         params["click_count"] = int(click_count)
         if screenshot_id:
             params["screenshotId"] = screenshot_id
-        self._act("click", params, app=window.app)
+        await self._act("click", params, app=window.app)
 
-    def type_text(self, window: WindowRef, text: str) -> None:
+    async def type_text(self, window: WindowRef, text: str) -> None:
         """Type literal text into a window's current focus."""
-        self._act("type_text", {"window": window.to_helper(), "text": text}, app=window.app)
+        await self._act(
+            "type_text", {"window": window.to_helper(), "text": text}, app=window.app
+        )
 
-    def press_key(self, window: WindowRef, key: str) -> None:
+    async def press_key(self, window: WindowRef, key: str) -> None:
         """Press a key chord, e.g. ``Control_L+a`` or ``Return``."""
         if not key or not key.strip():
             raise ValueError("key is required")
-        self._act("press_key", {"window": window.to_helper(), "key": key}, app=window.app)
+        await self._act(
+            "press_key", {"window": window.to_helper(), "key": key}, app=window.app
+        )
 
-    def scroll(
+    async def scroll(
         self,
         window: WindowRef,
         x: int,
@@ -310,9 +342,9 @@ class CuaClient:
         }
         if screenshot_id:
             params["screenshotId"] = screenshot_id
-        self._act("scroll", params, app=window.app)
+        await self._act("scroll", params, app=window.app)
 
-    def drag(
+    async def drag(
         self,
         window: WindowRef,
         from_x: int,
@@ -331,11 +363,11 @@ class CuaClient:
         }
         if screenshot_id:
             params["screenshotId"] = screenshot_id
-        self._act("drag", params, app=window.app)
+        await self._act("drag", params, app=window.app)
 
-    def set_value(self, window: WindowRef, element_index: int, value: str) -> None:
+    async def set_value(self, window: WindowRef, element_index: int, value: str) -> None:
         """Replace the value of an editable element."""
-        self._act(
+        await self._act(
             "set_value",
             {
                 "window": window.to_helper(),
@@ -345,11 +377,11 @@ class CuaClient:
             app=window.app,
         )
 
-    def perform_secondary_action(
+    async def perform_secondary_action(
         self, window: WindowRef, element_index: int, action: str
     ) -> None:
         """Invoke a secondary accessibility action, e.g. ``Expand``."""
-        self._act(
+        await self._act(
             "perform_secondary_action",
             {
                 "window": window.to_helper(),

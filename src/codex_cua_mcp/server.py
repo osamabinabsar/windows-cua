@@ -165,37 +165,39 @@ def build_server(
         instructions=INSTRUCTIONS,
     )
 
-    # The approval hook is installed per-request below; it needs the Context
-    # of the running tool call, which FastMCP/MCPServer passes in.
-    client = CuaClient(transport, on_approval=None)
+    # The approval hook needs the Context of the running tool call, so each
+    # call gets its own client bound to that call's hook. The transport --
+    # and therefore the helper process and the approved-app set -- is shared.
+    base_client = CuaClient(transport, on_approval=None)
 
-    def _approval_hook(ctx: Context, request: dict[str, Any]):
-        """Ask the user to approve an app. Returns True to allow."""
-        if auto_approve:
-            return True
-        app = str(request.get("app") or "")
-        display = str(request.get("displayName") or app)
-        risk = request.get("riskLevel")
-        risk_note = f" (risk: {risk})" if risk else ""
-        result = ctx.elicit(
-            message=(
-                f"Allow Computer Use to control '{display}'?{risk_note}\n"
-                f"App id: {app}\n\n"
-                "The agent will be able to read this window and send input to it "
-                "without bringing it to the foreground."
-            ),
-            schema=ApprovalDecision,
-        )
-        action = getattr(result, "action", None)
-        if action != "accept":
-            return False
-        data = getattr(result, "data", None)
-        if data is None:
-            return False
-        allow = bool(getattr(data, "allow", False))
-        if allow:
-            transport.approve(app)
-        return allow
+    def _client_for(ctx: Context) -> CuaClient:
+        """A client whose approval hook elicits this call's user."""
+
+        async def hook(request: dict[str, Any]) -> bool:
+            if auto_approve:
+                return True
+            app = str(request.get("app") or "")
+            display = str(request.get("displayName") or app)
+            risk = request.get("riskLevel")
+            risk_note = f" (risk: {risk})" if risk else ""
+            result = await ctx.elicit(
+                message=(
+                    f"Allow Computer Use to control '{display}'?{risk_note}\n"
+                    f"App id: {app}\n\n"
+                    "The agent will be able to read this window and send input to it "
+                    "without bringing it to the foreground."
+                ),
+                schema=ApprovalDecision,
+            )
+            action = getattr(result, "action", None)
+            if action != "accept":
+                return False
+            data = getattr(result, "data", None)
+            if data is None:
+                return False
+            return bool(getattr(data, "allow", False))
+
+        return base_client.with_approval_hook(hook)
 
     # -- discovery ---------------------------------------------------------
 
@@ -207,7 +209,7 @@ def build_server(
         ),
     )
     def list_apps() -> str:
-        apps = client.list_apps()
+        apps = base_client.list_apps()
         lines = []
         for a in apps:
             flag = "running" if a["isRunning"] else "idle"
@@ -224,7 +226,7 @@ def build_server(
         ),
     )
     def list_windows() -> str:
-        return format_windows(client.list_windows())
+        return format_windows(base_client.list_windows())
 
     @server.tool(
         title="Get window",
@@ -234,7 +236,7 @@ def build_server(
         ),
     )
     def get_window(window_id: int, app: str) -> str:
-        ref = client.get_window(window_id, app)
+        ref = base_client.get_window(window_id, app)
         return f"id={ref.id} app={ref.app} title={ref.title!r}"
 
     # -- observation -------------------------------------------------------
@@ -255,15 +257,15 @@ def build_server(
         include_screenshot: bool = False,
     ) -> str:
         ref = _window_ref(app, window_id)
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            state = client.get_window_state(
+            state = await client.get_window_state(
                 ref,
                 include_screenshot=include_screenshot,
                 include_text=include_text,
             )
-        finally:
-            client._on_approval = None
+        except HelperError as exc:
+            return f"could not read window state: {_err(exc)}"
         return _state_summary(state)
 
     @server.tool(
@@ -275,11 +277,11 @@ def build_server(
     )
     async def read_accessibility_tree(ctx: Context, app: str, window_id: int) -> str:
         ref = _window_ref(app, window_id)
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            tree = client.accessibility_tree(ref)
-        finally:
-            client._on_approval = None
+            tree = await client.accessibility_tree(ref)
+        except HelperError as exc:
+            return f"could not read accessibility tree: {_err(exc)}"
         return tree or "(empty accessibility tree)"
 
     # -- actions -----------------------------------------------------------
@@ -292,13 +294,11 @@ def build_server(
         ),
     )
     async def launch_app(ctx: Context, app: str) -> str:
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            await asyncio.to_thread(client.launch_app, app)
+            await client.launch_app(app)
         except HelperError as exc:
             return f"could not launch {app!r}: {_err(exc)}"
-        finally:
-            client._on_approval = None
         return f"launched {app!r}; call list_apps or list_windows to see its window"
 
     @server.tool(
@@ -320,10 +320,9 @@ def build_server(
         click_count: int = 1,
     ) -> str:
         ref = _window_ref(app, window_id)
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            await asyncio.to_thread(
-                client.click,
+            await client.click(
                 ref,
                 x=x,
                 y=y,
@@ -333,8 +332,6 @@ def build_server(
             )
         except HelperError as exc:
             return f"click failed: {_err(exc)}"
-        finally:
-            client._on_approval = None
         target = f"element {element_index}" if element_index is not None else f"({x}, {y})"
         return f"clicked {target} in window {window_id}"
 
@@ -348,13 +345,11 @@ def build_server(
     )
     async def type_text(ctx: Context, app: str, window_id: int, text: str) -> str:
         ref = _window_ref(app, window_id)
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            await asyncio.to_thread(client.type_text, ref, text)
+            await client.type_text(ref, text)
         except HelperError as exc:
             return f"type failed: {_err(exc)}"
-        finally:
-            client._on_approval = None
         return f"typed {len(text)} chars into window {window_id}"
 
     @server.tool(
@@ -367,13 +362,11 @@ def build_server(
     )
     async def press_key(ctx: Context, app: str, window_id: int, key: str) -> str:
         ref = _window_ref(app, window_id)
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            await asyncio.to_thread(client.press_key, ref, key)
+            await client.press_key(ref, key)
         except HelperError as exc:
             return f"press_key failed: {_err(exc)}"
-        finally:
-            client._on_approval = None
         return f"pressed {key!r} in window {window_id}"
 
     @server.tool(
@@ -394,15 +387,11 @@ def build_server(
         scroll_y: int = 0,
     ) -> str:
         ref = _window_ref(app, window_id)
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            await asyncio.to_thread(
-                client.scroll, ref, x, y, scroll_x, scroll_y
-            )
+            await client.scroll(ref, x, y, scroll_x, scroll_y)
         except HelperError as exc:
             return f"scroll failed: {_err(exc)}"
-        finally:
-            client._on_approval = None
         return f"scrolled ({scroll_x}, {scroll_y}) in window {window_id}"
 
     @server.tool(
@@ -422,13 +411,11 @@ def build_server(
         to_y: int,
     ) -> str:
         ref = _window_ref(app, window_id)
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            await asyncio.to_thread(client.drag, ref, from_x, from_y, to_x, to_y)
+            await client.drag(ref, from_x, from_y, to_x, to_y)
         except HelperError as exc:
             return f"drag failed: {_err(exc)}"
-        finally:
-            client._on_approval = None
         return f"dragged ({from_x},{from_y}) -> ({to_x},{to_y}) in window {window_id}"
 
     @server.tool(
@@ -442,13 +429,11 @@ def build_server(
         ctx: Context, app: str, window_id: int, element_index: int, value: str
     ) -> str:
         ref = _window_ref(app, window_id)
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            await asyncio.to_thread(client.set_value, ref, element_index, value)
+            await client.set_value(ref, element_index, value)
         except HelperError as exc:
             return f"set_value failed: {_err(exc)}"
-        finally:
-            client._on_approval = None
         return f"set element {element_index} in window {window_id}"
 
     @server.tool(
@@ -462,15 +447,11 @@ def build_server(
         ctx: Context, app: str, window_id: int, element_index: int, action: str
     ) -> str:
         ref = _window_ref(app, window_id)
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            await asyncio.to_thread(
-                client.perform_secondary_action, ref, element_index, action
-            )
+            await client.perform_secondary_action(ref, element_index, action)
         except HelperError as exc:
             return f"secondary action failed: {_err(exc)}"
-        finally:
-            client._on_approval = None
         return f"performed {action!r} on element {element_index} in window {window_id}"
 
     @server.tool(
@@ -484,13 +465,11 @@ def build_server(
     )
     async def activate_window(ctx: Context, app: str, window_id: int) -> str:
         ref = _window_ref(app, window_id)
-        client._on_approval = lambda req: _approval_hook(ctx, req)
+        client = _client_for(ctx)
         try:
-            await asyncio.to_thread(client.activate_window, ref)
+            await client.activate_window(ref)
         except HelperError as exc:
             return f"activate failed: {_err(exc)}"
-        finally:
-            client._on_approval = None
         return f"activated window {window_id} (it now has focus)"
 
     # -- diagnostics -------------------------------------------------------
