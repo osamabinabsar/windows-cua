@@ -76,13 +76,71 @@ anything proprietary — it is a real driver with its own:
 - `crates/platform-windows/src/input/keyboard.rs`, `mouse.rs`
 - `crates/cua-driver-contract/` — typed request/response contracts
 
-and it exposes **57 MCP tools** over stdio, with a `mcp-config --client`
-helper that emits ready-to-paste config for 12 harnesses (claude, codex,
-cursor, hermes, antigravity, openclaw, opencode, pi, prime-agent, qwen,
-droid, zcode).
-
 Its `launch_app` uses `SW_SHOWNOACTIVATE` — "the driver never brings the
 target to the foreground" — the same collaborative discipline.
+
+### What it actually is
+
+The driver is **itself an MCP server**, not a library to link against.
+`cua-driver mcp` speaks MCP over stdio and exposes **60 tools**:
+
+```
+bring_to_front  browser_click  browser_navigate  browser_type  click
+clipboard_read  clipboard_write  double_click  drag  get_accessibility_tree
+get_desktop_state  get_screen_size  get_window_state  hotkey  invoke_menu
+kill_app  launch_app  list_apps  list_sessions  list_windows  move_cursor
+press_key  right_click  run_script  run_steps  scroll  set_value
+set_window_frame  start_session  end_session  type_text  verify_state  ...
+```
+
+Two details make it a good fit for the "second version" the user asked
+for:
+
+**It already covers our tool surface.** `list_windows`, `get_window_state`,
+`get_accessibility_tree`, `click`, `type_text`, `press_key`, `set_value`,
+`scroll`, `drag`, `launch_app`, `kill_app` — every action this repo
+exposes, with the same names.
+
+**It fixes the three problems we had to work around.** The driver's
+`ClickInput` accepts `element_token` *or* `x`/`y` — so there is no
+"missing field x" trap. It requires an explicit
+`delivery_mode: "background"` on every input, so the collaborative
+discipline is enforced by the type system rather than by convention. And
+its `element_token` is a stable handle rather than a per-observation
+index, so the "element indexes are only valid for the observation that
+produced them" hazard does not exist.
+
+It also has `--claude-code-computer-use-compat`, which selects a
+Claude-Code-shaped tool surface from the same binary.
+
+### Wiring it up
+
+The driver ships the config generation itself, for 12 harnesses — including
+the ones named in the original request:
+
+```bash
+cua-driver mcp-config --client claude-code   # Claude Code
+cua-driver mcp-config --client codex
+cua-driver mcp-config --client opencode
+cua-driver mcp-config --client hermes
+```
+
+`--client` accepts `claude`/`claude-code`, `codex`, `cursor`, `openclaw`,
+`opencode`, `hermes`, `pi`, `prime-agent`, `antigravity`/`gemini`,
+`qwen`/`qwen-code`, `droid`/`factory`, `zcode`, and `generic`.
+
+This makes the "own version we can host on GitHub" goal **already
+satisfied** — with a far more reliable implementation than a rebuild
+would produce. What this repo adds on top is the parts a raw driver does
+not give you:
+
+- a **uniform tool surface** across the two backends, so a harness
+  config does not change when you swap drivers;
+- the **elicitation-based approval flow** — the driver has an
+  `ElicitRequest` in its schema, but the per-app consent model this
+  project exposes is worth keeping;
+- the **collaboration guarantees** stated in one place, and a `status`
+  tool that says which backend is actually in use.
 
 ### Comparison
 
@@ -93,9 +151,11 @@ target to the foreground" — the same collaborative discipline.
 | Works if Codex is uninstalled | No | Yes | Yes |
 | Publishable as-is | Yes (client) | Yes | Yes |
 | Effort to reach parity | Done | Done | Weeks |
-| Tool count | 15 | 57 | ? |
+| Tool count | 16 | 60 | ? |
 | Rust toolchain needed to build | No | Yes (no toolchain here) | Yes |
 | Maintenance burden | Low (protocol wrapper) | Low (upstream maintains) | High (we maintain) |
+| Element addressing | Per-observation index (stale-prone) | Stable `element_token` | ? |
+| Focus discipline | Convention + docs | Enforced by the input type | ? |
 
 ## The recommendation
 
@@ -121,12 +181,89 @@ for a ground-up rewrite.
 
 ### Suggested next steps, in order
 
-1. **Register Track A in Claude Code** and use it daily. That is the
-   fastest path to knowing whether it is reliable enough.
-2. **Add a `trycua/cua` backend** as a fallback driver, selectable by
+1. ~~**Register Track A in Claude Code** and use it daily. That is the
+   fastest path to knowing whether it is reliable enough.~~ **Done.**
+2. ~~**Add a `trycua/cua` backend** as a fallback driver, selectable by
    environment variable. The client layer is already a clean seam: both
-   backends implement the same `sky`-shaped API.
+   backends implement the same `sky`-shaped API.~~ **Done** — see below.
 3. **Use REA narrowly** — e.g. to answer "does the helper's background
    injection ever raise the window?" with evidence rather than inference.
 4. **Only then** consider a from-scratch build, and only if 1–3 show a
    specific capability the existing stack cannot provide.
+
+---
+
+## Track B, as built: the `cua` backend
+
+Step 2 is done. The `trycua/cua` driver is now a first-class backend in
+this repo, selected with `--backend cua` or `WINDOWS_CUA_BACKEND=cua`.
+
+```
+src/codex_cua_mcp/
+  cua_backend.py   a small MCP client for the driver (it is itself an MCP server)
+  cua_client.py    the same `sky`-shaped API, over the cua driver
+  server.py        build_server(backend=...) picks the transport
+```
+
+The driver version installed here is **v0.28.2** and it exposes **57
+tools** (the count moves as the driver ships). The sixteen tools this
+server exposes are a subset, with the same names and the same arguments
+as the Codex backend, so a harness config does not change when you swap
+drivers.
+
+### What the live driver taught us
+
+Every mapping was checked against the running driver, not against a
+guess. `scripts/probe_cua_driver.py` reads the driver's own `tools/list`
+schemas; `scripts/probe_cua_backend.py` runs twenty-three behavioural
+checks against Character Map. Six things were wrong or missing in the
+first implementation, and all six are now handled:
+
+1. **`set_value` refuses a bare `element_index`.** The driver wants an
+   `element_token`, or a `snapshot_id` alongside the index. The client
+   resolves the index to a token from a fresh read, so the handle is
+   never stale when it is used.
+2. **`get_accessibility_tree` returns a desktop-wide view**
+   (`{"processes": [...], "windows": [...]}`) whose window entries carry
+   geometry but no tree. The per-window tree is what `get_window_state`
+   returns as `tree_markdown`, and that is what the client uses.
+3. **Some window classes refuse background input.** A dialog will not
+   take a background scroll. The driver detects this, says so, and asks
+   for `delivery_mode: "foreground"` — which it performs as a brief
+   focus swap that restores the previous foreground afterwards. The
+   client takes that escalation, and never fronts a window on a guess.
+4. **There is no accessibility-action tool.** The closest is
+   `invoke_menu`, which walks an application *menu* path. So a menu path
+   (`File>Save As`) goes to `invoke_menu`; a plain action name (`Invoke`)
+   is honoured by clicking the element; and anything the driver cannot
+   express **raises** rather than silently doing nothing.
+5. **A launch target's shape decides the field.** `charmap.exe` is an
+   installed app's file name and goes in `name`; `C:\Windows\...` is a
+   path and goes in `path`.
+6. **The driver reports a window's edit-control text with a trailing
+   CR.** A field set to `probe` reads back as `probe\r`.
+
+### The two backends are not identical, and the differences are stated
+
+`perform_secondary_action` is the one tool whose meaning genuinely
+differs between the drivers, and the difference is in the tool
+description, the `CUA_INSTRUCTIONS` block, and the README table — not
+hidden behind a flag.
+
+### Licensing
+
+The `cua` backend is the one to use if the point of a public repo is that
+it stands on its own. The driver is MIT-licensed, the client is
+MIT-licensed, and neither has an OpenAI dependency. The `codex` backend
+is a client of a documented interface and is also MIT-licensed, but it
+does require Codex CLI on the machine.
+
+### Why this is still not a "rebuild"
+
+The user's ask was "a version of our own, hosted on GitHub for others to
+use". This delivers that: `--backend cua` is a self-contained, MIT-only
+installation with no OpenAI binary, no account, and no usage limit. What
+it does *not* deliver is a reimplementation of the driver from scratch —
+that is upstream's job, maintained upstream, and reimplementing it would
+have been the least reliable option against a stated priority of quality
+and reliability.

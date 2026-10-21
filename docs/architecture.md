@@ -73,6 +73,26 @@ part of this tool.
 The `codex` CLI is needed only to broker the approval prompt. It is never
 used to run inference.
 
+### The second backend
+
+The same sixteen tools also run on the MIT-licensed
+[`trycua/cua`](https://github.com/trycua/cua) driver, which is itself an
+MCP server. The shape of the system does not change:
+
+```
+ ┌──────────────┐   MCP/stdio  ┌─────────────────┐   MCP/stdio  ┌──────────────────┐
+ │ Claude Code  │─────────────▶│  codex-cua-mcp  │─────────────▶│  cua-driver.exe  │
+ │ OpenCode     │              │  16 MCP tools   │◀─────────────│  (MIT, Rust)     │
+ └──────────────┘   responses  └─────────────────┘   responses  └──────────────────┘
+```
+
+`build_server(backend="cua")` swaps the transport. Both backends
+implement the same `sky`-shaped API — apps, windows, and window-relative
+actions — so the sixteen MCP tools are written once and the harness
+configuration does not change when you switch drivers. See
+[the alternatives doc](alternatives.md) for the differences that are real
+rather than cosmetic.
+
 ## Layers
 
 ### `transport.py` — the wire
@@ -143,6 +163,28 @@ user's answer is what authorises the action.
 Read-only tools (`list_apps`, `list_windows`, `get_window`, `status`) never
 trigger a prompt.
 
+### `cua_backend.py` and `cua_client.py` — the second driver
+
+`cua_backend.py` owns the `cua-driver.exe` subprocess. The driver is
+itself an MCP server, so this is a small MCP client: `initialize`, then
+`tools/call`, over newline-delimited JSON-RPC.
+
+`cua_client.py` maps the same `sky` API onto the driver's tools. The
+mapping is not one-to-one, and the differences are worth stating:
+
+- **Windows are addressed by pid + window_id**, not by an app id. The
+  driver has no app-id concept, so the client synthesises one as
+  `pid:<pid>` and keeps the pid alongside it.
+- **Delivery mode is explicit.** Every input carries `delivery_mode`, and
+  `"background"` keeps the target window from taking focus. This client
+  always asks for background, and escalates to foreground *only* when the
+  driver says background is impossible for that window class — which it
+  performs as a brief focus swap that restores the previous foreground.
+- **Element handles are tokens, not indexes.** The driver returns both
+  `element_index` and `element_token`, and it will not accept a bare
+  index for a value-setting action. The client resolves the index to a
+  token from a fresh read.
+
 ## Protocol reference
 
 Methods, with the parameter shapes the helper expects:
@@ -196,6 +238,33 @@ dangerous of the three, because the failure is invisible. Both methods
 now take an optional `element_index` that clicks the target first, and
 `set_value` — which needs no focus at all — is the reliable way to fill a
 field. An empty `set_value` clears it.
+
+### Four behaviours the cua driver does not advertise
+
+The same exercise, run against the `trycua/cua` driver. Each of these
+was found by running the driver, not by reading its documentation, and
+each is handled defensively in `cua_client.py`.
+
+**1. `set_value` refuses a bare `element_index`.** It wants an
+`element_token`, or a `snapshot_id` alongside the index. The client
+resolves the index against a fresh read and sends the token.
+
+**2. `get_accessibility_tree` returns a desktop-wide view**
+(`{"processes": [...], "windows": [...]}`) whose window entries carry
+geometry but no tree. The per-window tree is `get_window_state`'s
+`tree_markdown`, and that is what the client uses.
+
+**3. Some window classes refuse background input.** A dialog will not
+take a background scroll. The driver detects this, says so, and asks
+for `delivery_mode: "foreground"` — which it performs as a brief focus
+swap that restores the previous foreground window afterwards. The client
+takes that escalation and never fronts a window on a guess.
+
+**4. There is no accessibility-action tool.** The closest is
+`invoke_menu`, which walks an application *menu* path. So a menu path
+(`File>Save As`) goes to `invoke_menu`; a plain action name (`Invoke`,
+`Expand`, `Toggle`) is honoured by clicking the element; and anything the
+driver cannot express raises rather than silently doing nothing.
 
 ## Constraints worth knowing
 

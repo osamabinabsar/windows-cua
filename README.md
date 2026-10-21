@@ -15,6 +15,11 @@ machine, and there is nothing to be rate-limited by. The model is whatever
 your harness already talks to: Claude Code, OpenCode, Hermes, Codex, Gemini
 CLI, Cursor — anything that speaks MCP.
 
+It also has a **second backend** that needs no OpenAI binary at all: the
+MIT-licensed [`trycua/cua`](https://github.com/trycua/cua) driver. Same
+sixteen tools, same names, same arguments — a harness config does not
+change when you switch. See [Two backends](#two-backends).
+
 ---
 
 ## Why this is different from Windows-MCP
@@ -85,6 +90,19 @@ Verify the setup:
 ```bash
 codex-cua-mcp --check
 ```
+
+### The MIT backend (no OpenAI binary)
+
+If you would rather not depend on a proprietary binary, install the
+[`trycua/cua`](https://github.com/trycua/cua) driver instead and run the
+server with `--backend cua`:
+
+```bash
+codex-cua-mcp --backend cua --check
+```
+
+The driver is MIT-licensed and Rust; it needs no Codex CLI and no OpenAI
+account. See [Two backends](#two-backends).
 
 ---
 
@@ -180,7 +198,58 @@ uv run --project <path> python -m codex_cua_mcp.server
 Every action except `activate_window` leaves your foreground window, your
 focus, and your mouse cursor exactly where they were.
 
-### Where the text goes
+---
+
+## Two backends
+
+The server speaks to one of two drivers. Both present the same sixteen
+tools, so **your harness config does not change when you switch**.
+
+| | `codex` (default) | `cua` |
+|---|---|---|
+| Driver | `codex-computer-use.exe`, ships with Codex CLI | `cua-driver.exe`, from [trycua/cua](https://github.com/trycua/cua) |
+| Licence | Proprietary (OpenAI) | MIT |
+| Needs Codex CLI | Yes | No |
+| Needs an OpenAI account | No | No |
+| Approval | Per-app MCP elicitation you answer | The driver's own permission model |
+| Element handles | Per-observation indexes | Stable `element_token`s |
+| Input delivery | Per-window UI Automation | Explicit `delivery_mode`, background first |
+
+Switch with a flag:
+
+```bash
+python -m codex_cua_mcp.server --backend cua
+```
+
+or the `WINDOWS_CUA_BACKEND=cua` environment variable. `--driver` (or
+`CUA_DRIVER_BIN`) points at a specific `cua-driver.exe` if the
+auto-detection misses it.
+
+### The two differ in three places
+
+Both backends are honest about where they are not equivalent:
+
+1. **`perform_secondary_action`.** The Codex helper has a real
+   accessibility-action tool (`Expand`, `Collapse`, `Toggle`, `Invoke`).
+   The cua driver does not — its closest is `invoke_menu`, which walks an
+   application *menu* path. So on the cua backend, `File>Save As` goes
+   to `invoke_menu`, a plain action name like `Invoke` is honoured by
+   clicking the element, and anything it cannot express **raises** rather
+   than silently doing nothing.
+2. **Background delivery.** Some window classes (dialogs, for instance)
+   refuse background input. The cua driver detects that, says so, and
+   asks for `delivery_mode: "foreground"` — which it performs as a brief
+   focus swap that **restores your previous foreground window** after.
+   The client takes that escalation; it never fronts a window on a guess.
+3. **Text delivery.** The Codex helper's `type_text` goes to whatever
+   holds focus, so it needs an `element_index` to be reliable. The cua
+   driver routes keystrokes to the target window itself, so it works
+   without one — but pass `element_index` when you mean a specific
+   control.
+
+---
+
+## Where the text goes
 
 `type_text` and `press_key` send keystrokes to the control that holds focus
 in the target window. **If nothing holds focus there, the characters are
@@ -237,15 +306,17 @@ once, re-observe.
 
 ```
 src/codex_cua_mcp/
-  transport.py   JSON-RPC over the helper's stdio; approval handshake
-  client.py      the sky Windows API, typed
-  server.py      MCP surface + elicitation-based approval
-scripts/         protocol probes and a smoke test
+  transport.py     JSON-RPC over the helper's stdio; approval handshake
+  client.py        the sky Windows API, typed (Codex backend)
+  cua_backend.py   a small MCP client for the trycua/cua driver
+  cua_client.py    the same sky API, over the cua driver
+  server.py        MCP surface + elicitation-based approval
+scripts/           protocol probes and a smoke test
 ```
 
 ---
 
-## Checking the helper
+## Checking the drivers
 
 Codex ships a new helper build now and then, and the helper's
 undocumented behaviours are the fragile part of this project. When it
@@ -258,6 +329,16 @@ updates, re-check that the workarounds still hold:
 It runs eight checks against the live helper and reports pass/fail for
 each. The target is Character Map, which cannot hold a user document, so
 running it cannot damage your work.
+
+The cua backend has its own probe, with the same shape:
+
+```bash
+.venv\Scripts\python.exe scripts\probe_cua_backend.py
+```
+
+Twenty-three checks against the live `cua-driver.exe`. Run it after
+updating the driver — the driver moves faster than the helper, and its
+error messages are specific enough to tell you exactly what changed.
 
 See [the architecture doc](docs/architecture.md) for what the three
 workarounds are and why each is needed.

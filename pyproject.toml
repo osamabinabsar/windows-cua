@@ -1,7 +1,7 @@
 [project]
 name = "codex-cua-mcp"
 version = "0.1.0"
-description = "Collaborative Windows computer-use MCP server backed by the local Codex computer-use helper (no cloud, no usage limits)."
+description = "Collaborative Windows computer-use MCP server, backed by the local Codex computer-use helper or the MIT-licensed trycua/cua driver (no cloud, no usage limits)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

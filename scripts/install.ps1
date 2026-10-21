@@ -13,6 +13,11 @@
 .PARAMETER Harness
     Which harness to register with. One of: claude, codex, opencode, all.
 
+.PARAMETER Backend
+    Which driver to register. 'codex' (default) uses the helper that ships
+    with Codex CLI; 'cua' uses the MIT-licensed trycua/cua driver, which
+    needs no OpenAI binary at all.
+
 .PARAMETER RepoPath
     Path to a checkout of this repository on the target machine.
 
@@ -26,11 +31,17 @@
 
 .EXAMPLE
     .\scripts\install.ps1 -Harness all -RepoPath C:\code\windows-cua
+
+.EXAMPLE
+    .\scripts\install.ps1 -Harness claude -Backend cua
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('claude', 'codex', 'opencode', 'all')]
     [string]$Harness = 'claude',
+
+    [ValidateSet('codex', 'cua')]
+    [string]$Backend = 'codex',
 
     [string]$RepoPath = (Split-Path -Parent (Split-Path -Parent $PSCommandPath)),
 
@@ -161,6 +172,7 @@ Write-Step "codex-cua-mcp installer"
 Write-Host "    repo : $RepoPath"
 Write-Host "    user : $User"
 Write-Host "    harness: $Harness"
+Write-Host "    backend: $Backend"
 
 # --------------------------------------------------------------------------
 # 1. Tooling
@@ -198,45 +210,80 @@ if ($pythonOk) {
 }
 
 # --------------------------------------------------------------------------
-# 2. The helper binary
+# 2. The driver binary
 # --------------------------------------------------------------------------
 
-Write-Step "Locating codex-computer-use.exe"
+if ($Backend -eq 'cua') {
+    Write-Step "Locating cua-driver.exe"
 
-$helperCandidates = @()
-$localAppData = $env:LOCALAPPDATA
-if ($localAppData) {
-    $helperCandidates += Get-ChildItem -Path "$localAppData\OpenAI\Codex\runtimes\cua_node" `
-        -Filter "codex-computer-use.exe" -Recurse -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty FullName
-}
+    # The driver's own installer puts it here. The 'current' package is a
+    # pointer; an archived release sits beside it.
+    $driverRoot = Join-Path $env:USERPROFILE ".cua-driver\packages"
+    $driver = $null
+    if (Test-Path $driverRoot) {
+        $candidate = Join-Path $driverRoot "current\cua-driver.exe"
+        if (Test-Path $candidate) {
+            $driver = $candidate
+        } else {
+            $release = Get-ChildItem -Path $driverRoot -Filter "cua-driver.exe" `
+                -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match 'releases' } |
+                Sort-Object { (Get-Item $_.FullName).LastWriteTime } -Descending |
+                Select-Object -First 1
+            if ($release) { $driver = $release.FullName }
+        }
+    }
+    if (-not $driver) {
+        $cmd = Get-Command cua-driver -ErrorAction SilentlyContinue
+        if ($cmd) { $driver = $cmd.Source }
+    }
 
-$helper = $helperCandidates | Sort-Object { (Get-Item $_).LastWriteTime } -Descending | Select-Object -First 1
-
-if ($helper) {
-    Write-Ok "helper: $helper"
+    if ($driver) {
+        Write-Ok "driver: $driver"
+    } else {
+        Write-Warn "cua-driver.exe not found."
+        Write-Warn "Install the driver from https://github.com/trycua/cua, then"
+        Write-Warn "re-run this script. If you install it elsewhere, set"
+        Write-Warn "CUA_DRIVER_BIN to the executable's full path."
+    }
 } else {
-    Write-Warn "codex-computer-use.exe not found."
-    Write-Warn "Install Codex CLI on this machine:  npm install -g @openai/codex"
-    Write-Warn "Then re-run this script. If you install it elsewhere, set"
-    Write-Warn "CODEX_COMPUTER_USE_BIN to the executable's full path."
-}
+    Write-Step "Locating codex-computer-use.exe"
 
-# The codex CLI is used for the approval handshake.
-$codexCli = $null
-if ($localAppData) {
-    $codexCli = Get-ChildItem -Path "$localAppData\OpenAI\Codex\bin" -Filter "codex.exe" `
-        -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-}
-if (-not $codexCli) {
-    $cmd = Get-Command codex -ErrorAction SilentlyContinue
-    if ($cmd) { $codexCli = $cmd.Source }
-}
-if ($codexCli) {
-    Write-Ok "codex cli: $codexCli"
-} else {
-    Write-Warn "codex CLI not found -- the approval handshake may not work."
-    Write-Warn "Install it with:  npm install -g @openai/codex"
+    $helperCandidates = @()
+    $localAppData = $env:LOCALAPPDATA
+    if ($localAppData) {
+        $helperCandidates += Get-ChildItem -Path "$localAppData\OpenAI\Codex\runtimes\cua_node" `
+            -Filter "codex-computer-use.exe" -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName
+    }
+
+    $helper = $helperCandidates | Sort-Object { (Get-Item $_).LastWriteTime } -Descending | Select-Object -First 1
+
+    if ($helper) {
+        Write-Ok "helper: $helper"
+    } else {
+        Write-Warn "codex-computer-use.exe not found."
+        Write-Warn "Install Codex CLI on this machine:  npm install -g @openai/codex"
+        Write-Warn "Then re-run this script. If you install it elsewhere, set"
+        Write-Warn "CODEX_COMPUTER_USE_BIN to the executable's full path."
+    }
+
+    # The codex CLI is used for the approval handshake.
+    $codexCli = $null
+    if ($localAppData) {
+        $codexCli = Get-ChildItem -Path "$localAppData\OpenAI\Codex\bin" -Filter "codex.exe" `
+            -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $codexCli) {
+        $cmd = Get-Command codex -ErrorAction SilentlyContinue
+        if ($cmd) { $codexCli = $cmd.Source }
+    }
+    if ($codexCli) {
+        Write-Ok "codex cli: $codexCli"
+    } else {
+        Write-Warn "codex CLI not found -- the approval handshake may not work."
+        Write-Warn "Install it with:  npm install -g @openai/codex"
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -271,10 +318,10 @@ try {
 $venvPython = Join-Path $RepoPath ".venv\Scripts\python.exe"
 if (Test-Path $venvPython) {
     $serverCmd = $venvPython
-    $serverArgs = @("-m", "codex_cua_mcp.server")
+    $serverArgs = @("-m", "codex_cua_mcp.server", "--backend", $Backend)
 } else {
     $serverCmd = "uv"
-    $serverArgs = @("run", "--project", $RepoPath, "python", "-m", "codex_cua_mcp.server")
+    $serverArgs = @("run", "--project", $RepoPath, "python", "-m", "codex_cua_mcp.server", "--backend", $Backend)
 }
 
 # The full command as a single array, for harnesses that want one.
