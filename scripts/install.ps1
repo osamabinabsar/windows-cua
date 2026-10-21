@@ -19,6 +19,11 @@
 .PARAMETER User
     Local Windows account to install for. Defaults to the current user.
 
+.PARAMETER ConfigRoot
+    Directory that holds the per-user config (.codex, .config). Defaults to
+    the user profile. Redirect it to test the registration without touching
+    a real config.
+
 .EXAMPLE
     .\scripts\install.ps1 -Harness all -RepoPath C:\code\windows-cua
 #>
@@ -29,7 +34,9 @@ param(
 
     [string]$RepoPath = (Split-Path -Parent (Split-Path -Parent $PSCommandPath)),
 
-    [string]$User = $env:USERNAME
+    [string]$User = $env:USERNAME,
+
+    [string]$ConfigRoot = $env:USERPROFILE
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +54,107 @@ function Write-Ok {
 function Write-Warn {
     param([string]$Message)
     Write-Host "    !  $Message" -ForegroundColor Yellow
+}
+
+function ConvertTo-ArgumentString {
+    <#
+    .SYNOPSIS
+        Join arguments into a Windows command line, quoting as needed.
+
+    .DESCRIPTION
+        ProcessStartInfo.ArgumentList does not exist in .NET Framework, so
+        Windows PowerShell 5.1 needs a single argument string. This quotes
+        per the CommandLineToArgvW rules: wrap in double quotes, escape
+        embedded quotes with a backslash, and double any backslashes that
+        sit immediately before a quote or the closing quote.
+    #>
+    param([string[]]$Arguments)
+
+    $parts = foreach ($arg in $Arguments) {
+        if ($null -eq $arg) { '""'; continue }
+        if ($arg -notmatch '[\s"]') { $arg; continue }
+
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append('"')
+        $slashes = 0
+        foreach ($c in $arg.ToCharArray()) {
+            if ($c -eq '\') { $slashes++; continue }
+            if ($c -eq '"') {
+                [void]$sb.Append('\' * ($slashes + 1))
+                [void]$sb.Append('"')
+                $slashes = 0
+                continue
+            }
+            if ($slashes -gt 0) { [void]$sb.Append('\' * $slashes); $slashes = 0 }
+            [void]$sb.Append($c)
+        }
+        if ($slashes -gt 0) { [void]$sb.Append('\' * ($slashes * 2)) }
+        [void]$sb.Append('"')
+        $sb.ToString()
+    }
+    return ($parts -join ' ')
+}
+
+function Invoke-Native {
+    <#
+    .SYNOPSIS
+        Run a native executable, capturing stdout and stderr.
+
+    .DESCRIPTION
+        Windows PowerShell 5.1 wraps a native command's stderr as
+        ErrorRecord objects, and with $ErrorActionPreference = 'Stop' a
+        command that merely *writes* to stderr (uv does, on every run)
+        becomes a terminating error even though it exited 0. This runs the
+        command with stderr redirected separately, so progress chatter is
+        captured as text instead of raising.
+
+    .PARAMETER FilePath
+        The executable.
+
+    .PARAMETER Arguments
+        Arguments to pass.
+
+    .PARAMETER WorkingDirectory
+        The directory to run in. PowerShell's Set-Location does NOT change
+        the .NET current directory that child processes inherit, so this
+        must be set explicitly whenever a child resolves a relative path.
+
+    .PARAMETER IgnoreExitCode
+        Do not throw on a non-zero exit code.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [string]$WorkingDirectory = $null,
+        [switch]$IgnoreExitCode
+    )
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = ConvertTo-ArgumentString -Arguments $Arguments
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    # Read both pipes concurrently: reading them in sequence can deadlock
+    # when the child fills the stderr buffer while we wait on stdout.
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    $proc.WaitForExit()
+    $stdout = $stdoutTask.Result
+    $stderr = $stderrTask.Result
+
+    if (-not $IgnoreExitCode -and $proc.ExitCode -ne 0) {
+        throw "$FilePath exited $($proc.ExitCode): $stderr"
+    }
+    return [pscustomobject]@{
+        ExitCode = $proc.ExitCode
+        StdOut   = $stdout
+        StdErr   = $stderr
+    }
 }
 
 Write-Step "codex-cua-mcp installer"
@@ -69,10 +177,19 @@ if ($uv) {
     exit 1
 }
 
+# Look for an already-installed CPython 3.11+ that uv can use. The output
+# lines look like "cpython-3.14.7-windows-x86_64-none  <path>"; a version
+# with no path is only downloadable, which is still fine.
 $pythonOk = $false
 try {
-    $ver = & uv python list 2>$null | Select-String '3\.1[1-9]|3\.2[0-9]' | Select-Object -First 1
-    if ($ver) { $pythonOk = $true }
+    $list = Invoke-Native -FilePath $uv.Source -Arguments @("python", "list")
+    $ver = ($list.StdOut + "`n" + $list.StdErr) -split "`n" |
+        Where-Object { $_ -match 'cpython-3\.(1[1-9]|[2-9][0-9])' } |
+        Select-Object -First 1
+    if ($ver) {
+        $pythonOk = $true
+        Write-Ok "python available: $($ver.Trim())"
+    }
 } catch { }
 if ($pythonOk) {
     Write-Ok "a suitable Python is available to uv"
@@ -130,20 +247,38 @@ Write-Step "Installing codex-cua-mcp"
 
 Push-Location $RepoPath
 try {
-    & uv venv --python 3.14 | Out-Null
-    & uv pip install --python .\.venv\Scripts\python.exe -e . | Out-Null
+    $venvPython = Join-Path $RepoPath ".venv\Scripts\python.exe"
+    if (Test-Path $venvPython) {
+        Write-Ok "reusing existing .venv"
+    } else {
+        $venv = Invoke-Native -FilePath $uv.Source -Arguments @("venv", "--python", "3.14") `
+            -WorkingDirectory $RepoPath
+        if (-not (Test-Path $venvPython)) {
+            throw "uv venv did not produce $venvPython`n$($venv.StdErr)"
+        }
+        Write-Ok "created .venv"
+    }
+    # Install by absolute path: the child's working directory is not
+    # guaranteed to be the repo, and "." would then resolve elsewhere.
+    $install = Invoke-Native -FilePath $uv.Source -Arguments @(
+        "pip", "install", "--python", $venvPython, "-e", $RepoPath
+    ) -WorkingDirectory $RepoPath
     Write-Ok "installed into .venv"
 } finally {
     Pop-Location
 }
 
-$serverCmd = Join-Path $RepoPath ".venv\Scripts\python.exe"
-if (-not (Test-Path $serverCmd)) {
+$venvPython = Join-Path $RepoPath ".venv\Scripts\python.exe"
+if (Test-Path $venvPython) {
+    $serverCmd = $venvPython
+    $serverArgs = @("-m", "codex_cua_mcp.server")
+} else {
     $serverCmd = "uv"
     $serverArgs = @("run", "--project", $RepoPath, "python", "-m", "codex_cua_mcp.server")
-} else {
-    $serverArgs = @("-m", "codex_cua_mcp.server")
 }
+
+# The full command as a single array, for harnesses that want one.
+$serverCommand = @($serverCmd) + $serverArgs
 
 # --------------------------------------------------------------------------
 # 4. Register with harnesses
@@ -158,42 +293,83 @@ $register = {
                 Write-Warn "claude CLI not found; skipping Claude Code registration"
                 return
             }
-            & claude mcp remove codex-cua --scope user 2>$null | Out-Null
-            & claude mcp add --scope user codex-cua -- $serverCmd @serverArgs
+            # Removing first makes the script idempotent: re-running it
+            # replaces the entry instead of failing on a duplicate.
+            Invoke-Native -FilePath $claude.Source `
+                -Arguments @("mcp", "remove", "codex-cua", "--scope", "user") `
+                -IgnoreExitCode | Out-Null
+            $add = Invoke-Native -FilePath $claude.Source `
+                -Arguments (@("mcp", "add", "--scope", "user", "codex-cua", "--") + $serverCommand)
             Write-Ok "registered with Claude Code (user scope)"
+            $add.StdOut.Trim() -split "`n" | Select-Object -First 3 | ForEach-Object { Write-Host "      $_" }
         }
         'codex' {
-            $config = Join-Path $env:USERPROFILE ".codex\config.toml"
+            $config = Join-Path $ConfigRoot ".codex\config.toml"
             if (-not (Test-Path $config)) {
                 Write-Warn "$config not found; skipping Codex registration"
                 return
             }
+            # Drop any previous entry for this server so re-running the
+            # installer does not leave a duplicate TOML table. A TOML table
+            # runs until the next table header, so remove the header and
+            # every following line that is not a new table.
+            $lines = @(Get-Content -Path $config)
+            $kept = New-Object System.Collections.Generic.List[string]
+            $skipping = $false
+            foreach ($line in $lines) {
+                $trimmed = $line.Trim()
+                if ($trimmed -match '^\[') {
+                    $skipping = ($trimmed -eq '[mcp_servers.codex-cua]')
+                }
+                if (-not $skipping) { $kept.Add($line) }
+            }
             $block = @"
-
 [mcp_servers.codex-cua]
-command = '$serverCmd'
-args = [$(($serverArgs | ForEach-Object { "'$_'" }) -join ', ')]
+command = '$($serverCommand[0])'
+args = [$(($serverCommand | Select-Object -Skip 1 | ForEach-Object { "'$_'" }) -join ', ')]
 "@
-            Add-Content -Path $config -Value $block
+            # Write UTF-8 without a BOM. A BOM makes tomllib (and Rust's
+            # toml crate) reject the file outright.
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            $text = ($kept -join "`n").TrimEnd() + "`n`n" + $block
+            [System.IO.File]::WriteAllText($config, $text, $utf8NoBom)
             Write-Ok "registered with Codex CLI (~/.codex/config.toml)"
         }
         'opencode' {
-            $cfgDir = Join-Path $env:USERPROFILE ".config\opencode"
+            $cfgDir = Join-Path $ConfigRoot ".config\opencode"
             $cfg = Join-Path $cfgDir "opencode.json"
             if (-not (Test-Path $cfgDir)) {
                 New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
             }
-            $entry = @"
-  ""codex-cua"": {
-    ""type"": ""local"",
-    ""command"": [$(($serverArgs | ForEach-Object { "'$_'" }) -join ', ')],
-    ""enabled"": true
-  }
-"@
+            # Build the entry as a JSON object and merge it into the config,
+            # so an existing opencode.json stays valid JSON. Appending raw
+            # text to it does not.
+            $entry = [ordered]@{
+                type    = 'local'
+                command = @($serverCommand)
+                enabled = $true
+            }
             if (Test-Path $cfg) {
-                Add-Content -Path $cfg -Value $entry
+                try {
+                    $existing = Get-Content -Path $cfg -Raw | ConvertFrom-Json
+                } catch {
+                    Write-Warn "existing opencode.json is not valid JSON; leaving it alone"
+                    Write-Warn "add manually: mcp.codex-cua -> $cfg"
+                    return
+                }
+                if (-not $existing.PSObject.Properties['mcp']) {
+                    $existing | Add-Member -NotePropertyName mcp -NotePropertyValue ([pscustomobject]@{})
+                }
+                $mcp = $existing.mcp
+                if ($mcp.PSObject.Properties['codex-cua']) {
+                    $mcp.PSObject.Properties['codex-cua'].Value = [pscustomobject]$entry
+                } else {
+                    $mcp | Add-Member -NotePropertyName 'codex-cua' -NotePropertyValue ([pscustomobject]$entry)
+                }
+                $existing | ConvertTo-Json -Depth 10 | Set-Content -Path $cfg -Encoding utf8
             } else {
-                @"{`n  ""mcp"": {`n$entry  }`n}"@ | Set-Content -Path $cfg -Encoding utf8
+                $doc = [ordered]@{ mcp = [ordered]@{ 'codex-cua' = $entry } }
+                $doc | ConvertTo-Json -Depth 10 | Set-Content -Path $cfg -Encoding utf8
             }
             Write-Ok "registered with OpenCode (~/.config/opencode/opencode.json)"
         }
@@ -213,11 +389,16 @@ if ($Harness -eq 'all') {
 Write-Step "Verifying"
 Push-Location $RepoPath
 try {
-    & $serverCmd @serverArgs --check
-    if ($LASTEXITCODE -eq 0) {
+    $check = Invoke-Native -FilePath $serverCommand[0] `
+        -Arguments (($serverCommand | Select-Object -Skip 1) + @("--check")) `
+        -WorkingDirectory $RepoPath `
+        -IgnoreExitCode
+    if ($check.ExitCode -eq 0) {
         Write-Ok "server check passed"
+        $check.StdOut.Trim() -split "`n" | ForEach-Object { Write-Host "      $_" }
     } else {
-        Write-Warn "server check failed (exit $LASTEXITCODE)"
+        Write-Warn "server check failed (exit $($check.ExitCode))"
+        $check.StdErr.Trim() -split "`n" | Select-Object -First 5 | ForEach-Object { Write-Host "      $_" }
     }
 } finally {
     Pop-Location
