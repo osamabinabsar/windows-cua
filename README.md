@@ -35,8 +35,27 @@ background injection, instead of a global cursor-and-keyboard takeover.
 
 ## Install
 
+### One machine
+
+```powershell
+git clone https://github.com/osamabinabsar/windows-cua
+cd windows-cua
+.\scripts\install.ps1 -Harness claude
+```
+
+The installer creates a virtualenv, installs the package, registers the
+server with your harness, and verifies it can find the helper. It is
+idempotent — run it again after a `git pull` and it will update in place.
+
+`-Harness` accepts `claude`, `codex`, `opencode`, or `all`.
+
+To install on **another PC**, clone the repo there and run the same script.
+The only thing each machine needs is [Codex CLI](https://github.com/openai/codex)
+installed, because that is what supplies the helper binary.
+
+### Manually
+
 ```bash
-# From a checkout
 uv pip install -e .
 ```
 
@@ -59,7 +78,7 @@ uv run --with "mcp>=2" python -m codex_cua_mcp.server
 
   Override with `CODEX_COMPUTER_USE_BIN` if yours lives elsewhere.
 
-- Python 3.11+
+- Python 3.11+ (or `uv`, which will fetch one)
 
 Verify the setup:
 
@@ -71,11 +90,14 @@ codex-cua-mcp --check
 
 ## Register with your harness
 
+The installer does this for you (`.\scripts\install.ps1 -Harness claude`).
+To do it by hand:
+
 ### Claude Code
 
 ```bash
-claude mcp add codex-cua -- \
-  uv run --project /path/to/windows-cua python -m codex_cua_mcp.server
+claude mcp add --scope user codex-cua -- \
+  C:\path\to\windows-cua\.venv\Scripts\python.exe -m codex_cua_mcp.server
 ```
 
 Or as JSON (`~/.claude.json` / `.mcp.json`):
@@ -84,8 +106,8 @@ Or as JSON (`~/.claude.json` / `.mcp.json`):
 {
   "mcpServers": {
     "codex-cua": {
-      "command": "uv",
-      "args": ["run", "--project", "C:\\path\\to\\windows-cua", "python", "-m", "codex_cua_mcp.server"],
+      "command": "C:\\path\\to\\windows-cua\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "codex_cua_mcp.server"],
       "env": {}
     }
   }
@@ -94,12 +116,14 @@ Or as JSON (`~/.claude.json` / `.mcp.json`):
 
 ### OpenCode
 
+`~/.config/opencode/opencode.json`:
+
 ```json
 {
   "mcp": {
     "codex-cua": {
       "type": "local",
-      "command": ["uv", "run", "--project", "C:\\path\\to\\windows-cua", "python", "-m", "codex_cua_mcp.server"],
+      "command": ["C:\\path\\to\\windows-cua\\.venv\\Scripts\\python.exe", "-m", "codex_cua_mcp.server"],
       "enabled": true
     }
   }
@@ -108,17 +132,23 @@ Or as JSON (`~/.claude.json` / `.mcp.json`):
 
 ### Codex CLI
 
-Add to `~/.codex/config.toml`:
+`~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.codex-cua]
-command = "uv"
-args = ["run", "--project", "C:\\path\\to\\windows-cua", "python", "-m", "codex_cua_mcp.server"]
+command = 'C:\path\to\windows-cua\.venv\Scripts\python.exe'
+args = ['-m', 'codex_cua_mcp.server']
 ```
 
 ### Any other MCP client
 
 The server speaks MCP over stdio. Point any client at:
+
+```
+C:\path\to\windows-cua\.venv\Scripts\python.exe -m codex_cua_mcp.server
+```
+
+If you did not use the installer and have no virtualenv, the equivalent is:
 
 ```
 uv run --project <path> python -m codex_cua_mcp.server
