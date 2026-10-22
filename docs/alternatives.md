@@ -127,7 +127,17 @@ cua-driver mcp-config --client hermes
 
 `--client` accepts `claude`/`claude-code`, `codex`, `cursor`, `openclaw`,
 `opencode`, `hermes`, `pi`, `prime-agent`, `antigravity`/`gemini`,
-`qwen`/`qwen-code`, `droid`/`factory`, `zcode`, and `generic`.
+`qwen`/`qwen-code`, `droid`/`factory`, and `zcode`.
+
+Those were checked against cua-driver 0.28.2 on Windows: each one is
+accepted, and the aliases (`claude-code`, `gemini`, `qwen-code`,
+`factory`) work as well as the shorter spelling. There is no `generic`
+client — the driver rejects it and names its own list:
+
+```
+Unknown client 'generic'. Valid: claude, codex, cursor, antigravity,
+openclaw, opencode, hermes, pi, prime-agent, qwen, droid, zcode.
+```
 
 This makes the "own version we can host on GitHub" goal **already
 satisfied** — with a far more reliable implementation than a rebuild

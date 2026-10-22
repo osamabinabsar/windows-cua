@@ -5,7 +5,7 @@ description = "Collaborative Windows computer-use MCP server, backed by the loca
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Anagh" }]
+authors = [{ name = "Osama Bin Absar" }]
 keywords = ["mcp", "windows", "computer-use", "automation", "ui-automation"]
 classifiers = [
     "Development Status :: 3 - Alpha",

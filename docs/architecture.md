@@ -163,6 +163,34 @@ user's answer is what authorises the action.
 Read-only tools (`list_apps`, `list_windows`, `get_window`, `status`) never
 trigger a prompt.
 
+### `takeover.py` — the way out
+
+The user's side of the contract. A single chord —
+`Ctrl+Alt+Shift+Backspace` by default — is registered with
+`RegisterHotKey` (`MOD_NOREPEAT`), with a `GetAsyncKeyState` polling
+fallback for when another application already owns the combination.
+
+It sits *above* the drivers rather than inside them, and that placement is
+the point: the lever that stops the agent must not depend on the agent,
+the driver, or the harness agreeing to stop. The controller exposes one
+gate, and both backends call it before every request — so there are two
+choke points rather than one, and neither backend can be driven past it.
+
+Pressing the chord does four things, in this order: signal the helper's
+`Local\CodexComputerUseTurnEnded` event so it dismisses its own overlay
+cleanly, terminate the driver process, fail every pending request, and
+revoke every approval. The MCP server stays alive, so the harness sees
+failed calls rather than a dead server, and the agent can pick up again
+when the user presses the chord a second time.
+
+### `overlay.py` — the banner text
+
+The Codex helper draws a banner while it drives, and it reads its own
+text from `%USERPROFILE%\.codex\computer-use\config.json`. This module
+reads and writes that file, so the two sentences in the banner are the
+user's to choose without patching a binary. It knows nothing about the
+helper's internals — only the file's shape.
+
 ### `cua_backend.py` and `cua_client.py` — the second driver
 
 `cua_backend.py` owns the `cua-driver.exe` subprocess. The driver is
@@ -278,7 +306,8 @@ driver cannot express raises rather than silently doing nothing.
   wrong window.
 - **The Escape key still stops everything.** The helper watches for a
   physical Escape press and aborts the turn. That behaviour is inherited
-  and is deliberately not overridden.
+  and is deliberately not overridden. The take-over chord is an addition,
+  not a replacement — see `takeover.py` above.
 - **An app is named two ways, and both must be approved.** `launch_app`
   takes a bare executable name (`charmap.exe`); window-targeted calls
   carry the window's own app id, which for a non-packaged app is a
@@ -293,9 +322,11 @@ driver cannot express raises rather than silently doing nothing.
 
 ## Upstream
 
-- The helper ships with [Codex CLI](https://github.com/openai/codex) and
-  the `@oai/sky` package. The protocol above was reverse-read from the
-  shipped JavaScript client and confirmed against the live binary.
+- The helper ships with the **Codex desktop app**, under
+  `@oai/cua` and `@oai/sky` in the app's runtime. The
+  [Codex CLI](https://github.com/openai/codex) does *not* ship it — the
+  CLI on its own is not enough. The protocol above was reverse-read from
+  the shipped JavaScript client and confirmed against the live binary.
 - [`trycua/cua`](https://github.com/trycua/cua) is an independent,
   MIT-licensed Windows computer-use driver (Rust) with a comparable
   feature set. It is a good alternative foundation — see

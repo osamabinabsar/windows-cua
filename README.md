@@ -10,10 +10,15 @@ it, so you keep your focus, your mouse, and your keyboard while the agent
 works alongside you.
 
 It is backed by the **local** Codex computer-use helper — a Windows binary
-that ships with Codex CLI. No model runs through it, no request leaves your
+that ships with the Codex app. No model runs through it, no request leaves your
 machine, and there is nothing to be rate-limited by. The model is whatever
 your harness already talks to: Claude Code, OpenCode, Hermes, Codex, Gemini
 CLI, Cursor — anything that speaks MCP.
+
+> "No cloud" describes *this server*: it makes no network calls of its own.
+> The accessibility tree and the screenshot it returns go to your harness,
+> which passes them to your model provider — so what leaves your machine is
+> whatever your model already sees.
 
 It also has a **second backend** that needs no OpenAI binary at all: the
 MIT-licensed [`trycua/cua`](https://github.com/trycua/cua) driver. Same
@@ -45,26 +50,37 @@ background injection, instead of a global cursor-and-keyboard takeover.
 ```powershell
 git clone https://github.com/osamabinabsar/windows-cua
 cd windows-cua
-.\scripts\install.ps1 -Harness claude
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Harness claude
 ```
+
+> Windows ships with a `Restricted` execution policy, which blocks local
+> `.ps1` files. The `-ExecutionPolicy Bypass` above is scoped to that
+> one command. If your organisation manages the policy, ask it to allow
+> signed local scripts instead.
 
 The installer creates a virtualenv, installs the package, registers the
 server with your harness, and verifies it can find the helper. It is
 idempotent — run it again after a `git pull` and it will update in place.
 
 `-Harness` accepts `claude`, `codex`, `opencode`, or `all`.
+`-Backend` accepts `codex` (the default) or `cua`.
 
-To install on **another PC**, clone the repo there and run the same script.
-The only thing each machine needs is [Codex CLI](https://github.com/openai/codex)
-installed, because that is what supplies the helper binary.
+To install on **another PC**, clone the repo there and run the same
+script. See [Deploying to other PCs](docs/deploying-to-other-pcs.md).
+The one thing that does not copy across is the helper binary: it comes
+from the Codex app's runtime, not from this repo.
 
 ### Manually
 
+`uv pip` installs into a virtualenv, so make one first:
+
 ```bash
+uv venv
 uv pip install -e .
 ```
 
-Or run it without installing:
+Or run it straight from the checkout, without a separate install step — `uv`
+makes a virtualenv for it and installs the package into that:
 
 ```bash
 uv run --with "mcp>=2" python -m codex_cua_mcp.server
@@ -72,24 +88,43 @@ uv run --with "mcp>=2" python -m codex_cua_mcp.server
 
 **Requirements**
 
-- Windows 11 (or Windows 10 with UI Automation)
-- [Codex CLI](https://github.com/openai/codex) installed — it ships
-  `codex-computer-use.exe` and provides the `codex` binary used for the
-  approval handshake. The server finds both automatically:
+- Windows 10 or 11 with UI Automation. (The code checks `sys.platform`,
+  not the Windows version — it runs on either, but UI Automation
+  behaves differently on older builds.)
+- Python 3.11+, or [`uv`](https://docs.astral.sh/uv/), which will fetch
+  one. `uv` is what the installer uses.
+- Git, to clone the repo. There is no PyPI package yet.
+- For the `codex` backend: the Codex **app** (or a standalone helper
+  package), which supplies `codex-computer-use.exe`; and the `codex`
+  CLI, used for the approval handshake.
+
+  > The Codex **CLI** on its own is not enough. `npm i -g @openai/codex`
+  > ships the CLI but not the helper. The helper arrives with the Codex
+  > desktop app, which installs a runtime the server searches:
 
   ```
+  %LOCALAPPDATA%\OpenAI\Codex\runtimes\cua_node\*\bin\node_modules\@oai\cua\bin\windows\codex-computer-use.exe
   %LOCALAPPDATA%\OpenAI\Codex\runtimes\cua_node\*\bin\node_modules\@oai\sky\bin\windows\codex-computer-use.exe
   ```
 
-  Override with `CODEX_COMPUTER_USE_BIN` if yours lives elsewhere.
+  A current install carries **both** package names, and the server
+  searches both. Override with `CODEX_COMPUTER_USE_BIN` if yours lives
+  elsewhere.
 
-- Python 3.11+ (or `uv`, which will fetch one)
+  If you would rather not depend on an OpenAI binary at all, use the
+  `cua` backend below — it needs neither the app nor an account.
 
 Verify the setup:
 
 ```bash
-codex-cua-mcp --check
+.venv\Scripts\codex-cua-mcp.exe --check
 ```
+
+`codex-cua-mcp` is on your `PATH` only while the virtualenv is
+activated; the full path works from anywhere. `--check` reports which
+binaries it found — it is a *discovery* check, not a test of the whole
+chain, so read a clean report as "the pieces are present", not "the
+server works".
 
 ### The MIT backend (no OpenAI binary)
 
@@ -108,8 +143,15 @@ account. See [Two backends](#two-backends).
 
 ## Register with your harness
 
-The installer does this for you (`.\scripts\install.ps1 -Harness claude`).
+The installer does this for you
+(`powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Harness claude`).
 To do it by hand:
+
+> The examples below start the **default `codex` backend**. If you
+> installed the MIT driver instead, add `--backend cua` to the server's
+> arguments — otherwise you silently get the OpenAI binary whichever one
+> you meant. `WINDOWS_CUA_BACKEND=cua` in the server's environment does
+> the same thing.
 
 ### Claude Code
 
@@ -174,6 +216,85 @@ uv run --project <path> python -m codex_cua_mcp.server
 
 ---
 
+## Uninstalling
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Uninstall
+```
+
+That removes the `codex-cua` entries from `~/.claude.json`,
+`~/.codex/config.toml` and `~/.config/opencode/opencode.json` — and
+nothing else. The rest of each file is edited in place, byte for byte,
+so your other settings and their formatting survive. The virtualenv,
+the repository and every other setting are left alone.
+
+It is safe to run twice, and safe to run when you never installed
+anything. If it cannot remove one of the entries it says which file and
+leaves that file unchanged rather than risking it, and exits non-zero.
+
+---
+
+## Taking the computer back
+
+One chord stops the agent, from outside the harness, at any moment:
+
+```
+Ctrl + Alt + Shift + Backspace
+```
+
+Press it once and the agent loses the computer. Press it again and it
+gets it back. No panel, no tray icon, no prompt to answer.
+
+One press stops the action in flight, takes the on-screen banner down,
+revokes every approval the agent had been given, and leaves the server
+running so it can be resumed. While it is held, every computer-use call
+fails with a message telling the agent to stop and wait for you.
+
+The chord is armed automatically whenever the server starts. Change it
+with `--takeover-key "Ctrl+Alt+Shift+Pause"`, or switch it off with
+`--no-takeover`.
+
+[Full documentation →](docs/takeover-hotkey.md)
+
+---
+
+## The banner
+
+While the Codex helper is driving, it draws a banner on screen. Both
+sentences in it are yours to set, in a JSON file the helper already
+reads — no binary is patched:
+
+```
+%USERPROFILE%\.codex\computer-use\config.json
+```
+
+```json
+{
+  "accentColor": "#339cff",
+  "direction": "ltr",
+  "locale": "en-GB",
+  "strings": {
+    "usingComputer": "AI is controlling this computer",
+    "escToCancel": "Press Ctrl+Alt+Shift+Backspace to take over"
+  }
+}
+```
+
+```bash
+python scripts\set-overlay-text.py --show
+python scripts\set-overlay-text.py \
+    --using "AI is controlling this computer" \
+    --hint "Press Ctrl+Alt+Shift+Backspace to take over"
+```
+
+The helper reads it when it starts an overlay, so restart the MCP
+server to see the change. One rule: `escToCancel` is a *label*. It does
+not make a key work — point it at a key that actually stops the agent.
+
+[Full documentation →](docs/takeover-hotkey.md)
+
+---
+
 ## Tools
 
 | Tool | Purpose |
@@ -192,11 +313,15 @@ uv run --project <path> python -m codex_cua_mcp.server
 | `set_value` | Replace an editable element's value by index. Empty clears it. |
 | `perform_secondary_action` | `Expand`, `Collapse`, `Raise`, `Scroll Up`, … |
 | `launch_app` | Launch an app by id or `.exe` path. |
-| `activate_window` | **The only tool that takes focus.** Explicit escape hatch. |
+| `activate_window` | Brings a window to the front. The one tool that takes focus on purpose. |
 | `status` | Which binaries are in use, what is approved, helper log. |
 
 Every action except `activate_window` leaves your foreground window, your
-focus, and your mouse cursor exactly where they were.
+focus, and your mouse cursor exactly where they were — with one
+exception. On the `cua` backend, a window that refuses background input
+makes the driver ask for `delivery_mode: "foreground"`, which it
+performs as a brief focus swap that restores your previous window
+afterwards. The server never fronts a window on a guess.
 
 ---
 
@@ -207,9 +332,9 @@ tools, so **your harness config does not change when you switch**.
 
 | | `codex` (default) | `cua` |
 |---|---|---|
-| Driver | `codex-computer-use.exe`, ships with Codex CLI | `cua-driver.exe`, from [trycua/cua](https://github.com/trycua/cua) |
+| Driver | `codex-computer-use.exe`, ships with the Codex app | `cua-driver.exe`, from [trycua/cua](https://github.com/trycua/cua) |
 | Licence | Proprietary (OpenAI) | MIT |
-| Needs Codex CLI | Yes | No |
+| Needs the Codex app | Yes | No |
 | Needs an OpenAI account | No | No |
 | Approval | Per-app MCP elicitation you answer | The driver's own permission model |
 | Element handles | Per-observation indexes | Stable `element_token`s |
@@ -251,9 +376,10 @@ Both backends are honest about where they are not equivalent:
 
 ## Where the text goes
 
-`type_text` and `press_key` send keystrokes to the control that holds focus
-in the target window. **If nothing holds focus there, the characters are
-lost and the call still reports success.** So always pass `element_index`:
+On the `codex` backend, `type_text` and `press_key` send keystrokes to
+the control that holds focus in the target window. **If nothing holds
+focus there, the characters are lost and the call still reports
+success.** So always pass `element_index`:
 
 ```
 type_text(text="hello", element_index=3)   # clicks element 3, then types
@@ -262,6 +388,10 @@ set_value(element_index=3, value="hello")   # no focus needed — the reliable o
 
 `set_value` with an empty value clears the field. On Windows, `click`
 needs coordinates and `click_element` is the element-targeted path.
+
+The `cua` driver routes keystrokes to the target window itself, so
+`type_text` works there without an `element_index` — but pass one anyway
+when you mean a specific control.
 
 ---
 
@@ -311,8 +441,15 @@ src/codex_cua_mcp/
   cua_backend.py   a small MCP client for the trycua/cua driver
   cua_client.py    the same sky API, over the cua driver
   server.py        MCP surface + elicitation-based approval
+  takeover.py      the take-over chord, and the gate it closes
+  overlay.py       the helper's banner text
 scripts/           protocol probes and a smoke test
+tests/             the test suite; CI runs it on every push
 ```
+
+Every script in there is indexed in
+[`scripts/README.md`](scripts/README.md), with what it touches and what
+it does not.
 
 ---
 
@@ -336,12 +473,43 @@ The cua backend has its own probe, with the same shape:
 .venv\Scripts\python.exe scripts\probe_cua_backend.py
 ```
 
-Twenty-three checks against the live `cua-driver.exe`. Run it after
+Twenty-four checks against the live `cua-driver.exe`. Run it after
 updating the driver — the driver moves faster than the helper, and its
 error messages are specific enough to tell you exactly what changed.
 
 See [the architecture doc](docs/architecture.md) for what the three
 workarounds are and why each is needed.
+
+---
+
+## Troubleshooting
+
+| Symptom | Where to look |
+|---|---|
+| `ModuleNotFoundError: No module named 'codex_cua_mcp.takeover'` on a fresh clone | You are running an old checkout against new code, or the clone is missing files. Re-clone, or `git pull`. |
+| `Could not find codex-computer-use.exe` | The Codex **CLI** is not enough — the helper ships with the Codex app. See [Requirements](#install). Or use `--backend cua`. |
+| `failed to launch codex app-server: program not found` | The helper could not find the `codex` CLI. Set `CODEX_CLI_PATH` to its full path, or put `codex` on `PATH`. |
+| `codex-cua-mcp` is not recognised | The virtualenv is not activated. Use `.venv\Scripts\codex-cua-mcp.exe`. |
+| The mouse pointer disappears over parts of the screen (Explorer nav pane, VS Code file tree, Windows Search list, chat messages) — the item still highlights, but the arrow is gone | [The invisible cursor](docs/troubleshooting/invisible-cursor.md) |
+| The agent did not stop when you pressed the chord | `status` reports the take-over mode. `polling` means another app owns the chord and the fallback is in use; `none` means it is switched off. See [Taking the computer back](docs/takeover-hotkey.md). |
+
+The invisible cursor is a Windows 11 / display-driver compositing
+fault, not this server and not the MCP tooling. The doc records what
+was measured on the machine, what was ruled out, the three candidate
+mechanisms, and the by-eye tests that separate them — plus
+`scripts/fix-mouse-cursor.ps1`, which reports and (with Administrator,
+and a full power cycle) applies the MPO overrides.
+
+## More
+
+| Doc | What it is for |
+|---|---|
+| [Using it in other harnesses](docs/using-other-harnesses.md) | Pointing Claude Code, OpenCode, Codex CLI, Cursor, Gemini CLI or anything else at this server, and telling an agent it exists. |
+| [Deploying to other PCs](docs/deploying-to-other-pcs.md) | Installing on a second or third machine, and what does not copy across. |
+| [For new users](docs/for-new-users.md) | The short version, if you have never set up an MCP server before. |
+| [Taking the computer back](docs/takeover-hotkey.md) | The take-over chord, and the banner text. |
+| [Architecture](docs/architecture.md) | How the pieces fit together, and the three undocumented helper behaviours this project works around. |
+| [Alternatives](docs/alternatives.md) | The other projects in this space, and how they differ. |
 
 ## Licence
 

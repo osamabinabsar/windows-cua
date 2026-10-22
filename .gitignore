@@ -5,3 +5,5 @@ dist/
 build/
 *.egg-info/
 .pytest_cache/
+.tmp_nvresearch/
+.tmp_verify/
