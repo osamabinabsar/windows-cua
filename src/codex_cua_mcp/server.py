@@ -26,12 +26,18 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from mcp.server.mcpserver import Context, MCPServer
 from pydantic import BaseModel, Field
 
 from .client import CuaClient, WindowRef, format_windows
+from .takeover import (
+    DEFAULT_TAKEOVER_CHORD,
+    TakeoverController,
+    TakeoverError,
+    signal_helper_turn_ended,
+)
 from .transport import (
     ApprovalRequired,
     HelperError,
@@ -78,6 +84,14 @@ APPROVAL
 The first action against an app asks you to approve it. The request goes to
 the client as an elicitation, so you see it and decide. Approvals persist
 for the session.
+
+TAKE-OVER
+The user can stop you at any moment by pressing the take-over chord
+(Control+Alt+Shift+Backspace by default). That abandons the action in
+flight, dismisses the on-screen banner, and revokes every approval you
+had. While it is held, every computer-use call fails with a message
+saying so. If you see that message: stop, do not retry, and tell the
+user what you were doing and wait for them.
 """
 
 
@@ -112,6 +126,10 @@ def _window_ref(app: str, window_id: int, title: str | None = None) -> WindowRef
 
 
 def _err(exc: Exception) -> str:
+    if isinstance(exc, TakeoverError):
+        # The take-over message is already a full sentence addressed to
+        # the agent, so it does not need the class-name prefix.
+        return str(exc)
     return f"{type(exc).__name__}: {exc}"
 
 
@@ -273,12 +291,42 @@ class _CuaApi:
 # --------------------------------------------------------------------------
 
 
+def _make_takeover(chord: str | bool, on_stop: Callable[[], None]) -> TakeoverController:
+    """Build the take-over controller and arm it.
+
+    ``chord`` is the chord to watch, or False to switch the take-over
+    off. The controller is built either way, so the gate every
+    computer-use call passes through is the same shape; when the
+    take-over is off the gate simply never trips.
+    """
+    if chord is False:
+        return TakeoverController(on_change=None)
+
+    def _on_change(paused: bool, reason: str) -> None:
+        if not paused:
+            print("computer use resumed", file=sys.stderr)
+            return
+        print(
+            f"take-over: {chord} pressed -- stopping computer use",
+            file=sys.stderr,
+        )
+        # Let a running helper end its own turn, so it dismisses its
+        # overlay cleanly rather than being killed with the process.
+        signal_helper_turn_ended()
+        on_stop()
+
+    controller = TakeoverController(on_change=_on_change, chord=chord)
+    controller.start()
+    return controller
+
+
 def build_server(
     helper_path: str | None = None,
     codex_cli_path: str | None = None,
     auto_approve: bool = False,
     backend: str = "codex",
     driver_path: str | None = None,
+    takeover: str | bool = True,
 ) -> MCPServer:
     """Build the MCP server.
 
@@ -298,9 +346,13 @@ def build_server(
         change when you switch.
     driver_path:
         Explicit path to ``cua-driver.exe``. Auto-detected if omitted.
+    takeover:
+        The chord the user presses to take the computer back
+        (``Ctrl+Alt+Shift+Backspace`` by default), or False to switch the
+        take-over off.
     """
     if backend == "cua":
-        return _build_cua_server(driver_path=driver_path)
+        return _build_cua_server(driver_path=driver_path, takeover=takeover)
 
     resolved_helper = find_helper(helper_path)
     resolved_cli = find_codex_cli(codex_cli_path)
@@ -316,10 +368,12 @@ def build_server(
         instructions=INSTRUCTIONS,
     )
 
+    controller = _make_takeover(takeover, transport.stop)
+
     # The approval hook needs the Context of the running tool call, so each
     # call gets its own client bound to that call's hook. The transport --
     # and therefore the helper process and the approved-app set -- is shared.
-    base_client = CuaClient(transport, on_approval=None)
+    base_client = CuaClient(transport, on_approval=None, gate=controller.check)
 
     def _client_for(ctx: Context) -> CuaClient:
         """A client whose approval hook elicits this call's user."""
@@ -360,7 +414,10 @@ def build_server(
         ),
     )
     async def list_apps() -> str:
-        apps = await asyncio.to_thread(base_client.list_apps)
+        try:
+            apps = await asyncio.to_thread(base_client.list_apps)
+        except HelperError as exc:
+            return f"could not list apps: {_err(exc)}"
         lines = []
         for a in apps:
             flag = "running" if a["isRunning"] else "idle"
@@ -377,7 +434,10 @@ def build_server(
         ),
     )
     async def list_windows() -> str:
-        return format_windows(await asyncio.to_thread(base_client.list_windows))
+        try:
+            return format_windows(await asyncio.to_thread(base_client.list_windows))
+        except HelperError as exc:
+            return f"could not list windows: {_err(exc)}"
 
     @server.tool(
         title="Get window",
@@ -387,7 +447,10 @@ def build_server(
         ),
     )
     async def get_window(window_id: int, app: str) -> str:
-        ref = await asyncio.to_thread(base_client.get_window, window_id, app)
+        try:
+            ref = await asyncio.to_thread(base_client.get_window, window_id, app)
+        except HelperError as exc:
+            return f"could not get window: {_err(exc)}"
         return f"id={ref.id} app={ref.app} title={ref.title!r}"
 
     # -- observation -------------------------------------------------------
@@ -691,6 +754,8 @@ def build_server(
             f"alive       : {transport.is_alive()}",
             f"approved    : {', '.join(transport.approved_apps()) or '(none)'}",
             f"auto_approve: {auto_approve}",
+            f"take-over   : {controller.chord} ({controller.mode})"
+            + (" -- PAUSED" if controller.paused else ""),
         ]
         tail = transport.stderr_tail(limit=10)
         if tail:
@@ -699,6 +764,7 @@ def build_server(
         return "\n".join(lines)
 
     server._cua_transport = transport  # type: ignore[attr-defined]
+    server._takeover = controller  # type: ignore[attr-defined]
     return server
 
 
@@ -740,10 +806,21 @@ therefore takes two forms: a single word ('Invoke', 'Expand', 'Toggle',
 'Check', 'Uncheck') is honoured by clicking the element, and a menu path
 ('File>Save As') walks the application's menu. Anything else returns an
 error rather than doing nothing.
+
+TAKE-OVER
+The user can stop you at any moment by pressing the take-over chord
+(Control+Alt+Shift+Backspace by default). That abandons the action in
+flight, dismisses the on-screen banner, and stops the driver. While it is
+held, every computer-use call fails with a message saying so. If you see
+that message: stop, do not retry, and tell the user what you were doing
+and wait for them.
 """
 
 
-def _build_cua_server(driver_path: str | None = None) -> MCPServer:
+def _build_cua_server(
+    driver_path: str | None = None,
+    takeover: str | bool = True,
+) -> MCPServer:
     """Build the server on the `trycua/cua` driver.
 
     The same sixteen tools, the same names, the same arguments -- only the
@@ -755,7 +832,8 @@ def _build_cua_server(driver_path: str | None = None) -> MCPServer:
 
     resolved = find_cua_driver(driver_path)
     transport = CuaDriverTransport(driver_path=resolved)
-    client = CuaDriverClient(transport)
+    controller = _make_takeover(takeover, transport.stop)
+    client = CuaDriverClient(transport, gate=controller.check)
     api = _CuaApi(client)
 
     server = MCPServer(
@@ -777,7 +855,10 @@ def _build_cua_server(driver_path: str | None = None) -> MCPServer:
         ),
     )
     async def list_apps() -> str:
-        apps = await api.list_apps()
+        try:
+            apps = await api.list_apps()
+        except HelperError as exc:
+            return f"could not list apps: {_err(exc)}"
         lines = []
         for a in apps:
             flag = "running" if a["isRunning"] else "idle"
@@ -794,7 +875,10 @@ def _build_cua_server(driver_path: str | None = None) -> MCPServer:
         ),
     )
     async def list_windows() -> str:
-        return format_windows(await api.list_windows())
+        try:
+            return format_windows(await api.list_windows())
+        except HelperError as exc:
+            return f"could not list windows: {_err(exc)}"
 
     @server.tool(
         title="Get window",
@@ -804,7 +888,10 @@ def _build_cua_server(driver_path: str | None = None) -> MCPServer:
         ),
     )
     async def get_window(window_id: int, app: str) -> str:
-        ref = await api.get_window(window_id, app)
+        try:
+            ref = await api.get_window(window_id, app)
+        except HelperError as exc:
+            return f"could not get window: {_err(exc)}"
         return f"id={ref.id} app={ref.app} title={ref.title!r}"
 
     # -- observation -------------------------------------------------------
@@ -1097,10 +1184,13 @@ def _build_cua_server(driver_path: str | None = None) -> MCPServer:
                 f"driver      : {transport.driver_path}",
                 f"alive       : {transport.is_alive()}",
                 f"approval    : handled by the driver, not by this server",
+                f"take-over   : {controller.chord} ({controller.mode})"
+                + (" -- PAUSED" if controller.paused else ""),
             ]
         )
 
     server._cua_transport = transport  # type: ignore[attr-defined]
+    server._takeover = controller  # type: ignore[attr-defined]
     return server
 
 
@@ -1126,8 +1216,8 @@ def main() -> int:
         choices=("codex", "cua"),
         default=os.environ.get("WINDOWS_CUA_BACKEND", "codex"),
         help=(
-            "which driver to use: 'codex' (the helper that ships with Codex "
-            "CLI, default) or 'cua' (the trycua/cua driver)"
+            "which driver to use: 'codex' (the helper that ships with the "
+            "Codex desktop app, default) or 'cua' (the trycua/cua driver)"
         ),
     )
     parser.add_argument(
@@ -1154,6 +1244,22 @@ def main() -> int:
         "--check",
         action="store_true",
         help="verify the driver is discoverable and exit",
+    )
+    parser.add_argument(
+        "--no-takeover",
+        action="store_true",
+        help=(
+            "do not arm the take-over hotkey (the user then cannot stop "
+            "the agent from outside the harness)"
+        ),
+    )
+    parser.add_argument(
+        "--takeover-key",
+        default=DEFAULT_TAKEOVER_CHORD,
+        help=(
+            "the chord the user presses to take the computer back "
+            f"(default: {DEFAULT_TAKEOVER_CHORD})"
+        ),
     )
     args = parser.parse_args()
 
@@ -1189,6 +1295,7 @@ def main() -> int:
             auto_approve=args.auto_approve,
             backend=args.backend,
             driver_path=args.driver,
+            takeover=False if args.no_takeover else args.takeover_key,
         )
     except HelperNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1205,11 +1312,22 @@ def main() -> int:
         file=sys.stderr,
     )
 
+    controller = getattr(server, "_takeover", None)
+    if controller is not None and not args.no_takeover:
+        print(
+            f"take-over armed: press {args.takeover_key} to stop the agent",
+            file=sys.stderr,
+        )
+
     try:
         server.run(transport="stdio")
     except KeyboardInterrupt:
         with contextlib.suppress(Exception):
             server._cua_transport.close()  # type: ignore[attr-defined]
+    finally:
+        if controller is not None:
+            with contextlib.suppress(Exception):
+                controller.stop()
     return 0
 
 

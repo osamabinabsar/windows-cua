@@ -203,6 +203,42 @@ class CuaDriverTransport:
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def stop(self) -> None:
+        """Stop the driver, but leave the transport usable.
+
+        The mirror of :meth:`HelperTransport.stop` on the Codex side: the
+        driver process is terminated so an action in flight is abandoned
+        and the overlay it owns goes with it, any pending request is
+        failed, and the next request respawns the driver.
+
+        The ``trycua/cua`` driver has no approval model of its own, so
+        there are no approvals to revoke here.
+        """
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+            self._initialized = False
+        with self._io_lock:
+            for event, slot in self._pending.values():
+                slot.append({"error": "stopped by the user"})
+                event.set()
+            self._pending.clear()
+        if proc is None:
+            return
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except (OSError, ValueError):
+                pass
+
     # -- io ----------------------------------------------------------------
 
     def _read_loop(self) -> None:

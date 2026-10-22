@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .client import WindowRef
 from .cua_backend import CuaDriverError, CuaDriverTransport
@@ -85,8 +85,23 @@ class CuaDriverClient:
     translation of the shared API.
     """
 
-    def __init__(self, transport: CuaDriverTransport) -> None:
+    def __init__(
+        self,
+        transport: CuaDriverTransport,
+        gate: Callable[[], None] | None = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        transport:
+            The driver transport.
+        gate:
+            Optional callable, called before every driver call. It raises
+            if the user has taken the computer back -- the take-over gate
+            from :class:`~codex_cua_mcp.takeover.TakeoverController`.
+        """
         self._t = transport
+        self._gate = gate
 
     @property
     def transport(self) -> CuaDriverTransport:
@@ -94,7 +109,13 @@ class CuaDriverClient:
 
     # -- plumbing ----------------------------------------------------------
 
+    def _check_gate(self) -> None:
+        """Refuse the call if the user has taken the computer back."""
+        if self._gate is not None:
+            self._gate()
+
     async def _call(self, name: str, arguments: dict[str, Any]) -> Any:
+        self._check_gate()
         return await asyncio.to_thread(self._t.call_tool, name, arguments)
 
     async def _call_action(self, name: str, arguments: dict[str, Any]) -> Any:

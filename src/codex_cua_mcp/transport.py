@@ -96,17 +96,26 @@ class ApprovalRequired(HelperError):
 
 # Codex installs the runtime under
 # %LOCALAPPDATA%\OpenAI\Codex\runtimes\cua_node\<hash>\bin\node_modules\
-# @oai\sky\bin\windows\.
+# <package>\bin\windows\.
+#
+# The helper has shipped under two package names -- @oai/sky and @oai/cua --
+# and a current install carries BOTH. Globs for one name alone break on an
+# install that carries only the other, so both are searched.
 _CODEX_RUNTIME_GLOBS = (
+    "OpenAI/Codex/runtimes/cua_node/*/bin/node_modules/@oai/cua/bin/windows/codex-computer-use.exe",
+    "OpenAI/Codex/runtimes/cua_node/*/bin/node_modules/@oai/cua/bin/windows/codex-computer-use-arm64.exe",
     "OpenAI/Codex/runtimes/cua_node/*/bin/node_modules/@oai/sky/bin/windows/codex-computer-use.exe",
     "OpenAI/Codex/runtimes/cua_node/*/bin/node_modules/@oai/sky/bin/windows/codex-computer-use-arm64.exe",
 )
 
-# Fallback: the @oai/sky npm package if installed standalone.
+# Fallback: the @oai/sky or @oai/cua npm package if installed standalone.
 _SKY_PACKAGE_GLOBS = (
     "AppData/Roaming/npm/node_modules/@oai/sky/bin/windows/codex-computer-use.exe",
     "AppData/Roaming/npm/node_modules/@oai/sky/bin/windows/codex-computer-use-arm64.exe",
+    "AppData/Roaming/npm/node_modules/@oai/cua/bin/windows/codex-computer-use.exe",
+    "AppData/Roaming/npm/node_modules/@oai/cua/bin/windows/codex-computer-use-arm64.exe",
     ".local/share/pnpm/global/*/node_modules/@oai/sky/bin/windows/codex-computer-use.exe",
+    ".local/share/pnpm/global/*/node_modules/@oai/cua/bin/windows/codex-computer-use.exe",
 )
 
 
@@ -118,7 +127,7 @@ def find_helper(explicit: str | os.PathLike[str] | None = None) -> Path:
     """Locate ``codex-computer-use.exe``.
 
     Precedence: explicit path -> ``CODEX_COMPUTER_USE_BIN`` env -> Codex
-    runtime install -> standalone ``@oai/sky`` npm install.
+    runtime install -> standalone ``@oai/sky`` / ``@oai/cua`` npm install.
 
     Raises :class:`HelperNotFoundError` with actionable guidance if nothing
     is found.
@@ -160,10 +169,14 @@ def find_helper(explicit: str | os.PathLike[str] | None = None) -> Path:
 
     raise HelperNotFoundError(
         "Could not find codex-computer-use.exe.\n"
-        "Searched: Codex runtime installs and standalone @oai/sky packages.\n"
-        "Fix by either:\n"
-        "  * installing Codex CLI (npm i -g @openai/codex), or\n"
-        "  * setting CODEX_COMPUTER_USE_BIN to the executable's full path."
+        "Searched: Codex runtime installs and standalone @oai/sky / @oai/cua packages.\n"
+        "Note: the Codex CLI on its own (npm i -g @openai/codex) does NOT ship\n"
+        "this helper -- it comes with the Codex desktop app, or with a standalone\n"
+        "helper package. Fix by either:\n"
+        "  * installing the Codex app so its runtime is present, or\n"
+        "  * setting CODEX_COMPUTER_USE_BIN to the executable's full path.\n"
+        "Or use the MIT backend, which needs no OpenAI binary at all:\n"
+        "  codex-cua-mcp --backend cua"
     )
 
 
@@ -199,6 +212,23 @@ def find_codex_cli(explicit: str | os.Path[str] | None = None) -> Path | None:
 # --------------------------------------------------------------------------
 # Transport
 # --------------------------------------------------------------------------
+
+
+def _terminate(proc: subprocess.Popen[bytes]) -> None:
+    """Stop a helper process, escalating to a kill if it will not go."""
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 @dataclass
@@ -271,25 +301,44 @@ class HelperTransport:
             self._proc = None
         if proc is None:
             return
-        try:
-            if proc.stdin:
-                proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                proc.kill()
-            except OSError:
-                pass
+        _terminate(proc)
         # Wake anyone still waiting on a response.
         with self._io_lock:
             for event, slot in self._pending.values():
                 slot.append({"ok": False, "error": "helper closed"})
                 event.set()
             self._pending.clear()
+
+    def stop(self) -> None:
+        """Stop the helper, but leave the transport usable.
+
+        Unlike :meth:`close`, this does not put the transport into a
+        permanent closed state: the next request respawns the helper.
+        That is what a take-over needs -- the user takes the computer
+        back, and the agent can pick up again later.
+
+        Three things happen here. The helper process is terminated, so an
+        action that was in flight is abandoned and the overlay it owns
+        goes away with it. Any pending request is failed, so nothing is
+        left hanging. And every approved app is revoked, so the agent has
+        to ask again before it touches anything -- including the apps it
+        had already been allowed to use.
+        """
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+        if proc is not None:
+            _terminate(proc)
+        with self._io_lock:
+            for event, slot in self._pending.values():
+                slot.append({"ok": False, "error": "stopped by the user"})
+                event.set()
+            self._pending.clear()
+        self.revoke_approvals()
+
+    def revoke_approvals(self) -> None:
+        """Forget every approved app, so the next action asks again."""
+        self._approved_apps.clear()
 
     def __enter__(self) -> "HelperTransport":
         self.start()

@@ -27,7 +27,7 @@ import asyncio
 import inspect
 import json
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .transport import (
     APPROVED_APP_META_KEY,
@@ -96,6 +96,7 @@ class CuaClient:
         self,
         transport: HelperTransport,
         on_approval: Any = None,
+        gate: Callable[[], None] | None = None,
     ) -> None:
         """
         Parameters
@@ -108,9 +109,14 @@ class CuaClient:
             allow the app. When absent, actions against unapproved apps
             raise :class:`ApprovalRequired` instead of being silently
             approved.
+        gate:
+            Optional callable, called before every request. It raises if
+            the user has taken the computer back -- the take-over gate
+            from :class:`~codex_cua_mcp.takeover.TakeoverController`.
         """
         self._t = transport
         self._on_approval = on_approval
+        self._gate = gate
         # Window ids we have observed with a screenshot, so an
         # element-targeted action is not refused for want of geometry.
         self._observed: set[int] = set()
@@ -121,7 +127,7 @@ class CuaClient:
         Use this per tool call so each call carries its own consent
         callback instead of mutating shared state.
         """
-        sibling = CuaClient(self._t, on_approval=on_approval)
+        sibling = CuaClient(self._t, on_approval=on_approval, gate=self._gate)
         sibling._observed = self._observed
         return sibling
 
@@ -130,6 +136,11 @@ class CuaClient:
     @property
     def transport(self) -> HelperTransport:
         return self._t
+
+    def _check_gate(self) -> None:
+        """Refuse the call if the user has taken the computer back."""
+        if self._gate is not None:
+            self._gate()
 
     async def _act(
         self,
@@ -144,6 +155,7 @@ class CuaClient:
         sent to the helper in the approved-app meta key *only* after the
         user has actually approved that app.
         """
+        self._check_gate()
         try:
             return await asyncio.to_thread(
                 self._t.request, method, params, timeout=timeout, approved_app=app
@@ -176,6 +188,7 @@ class CuaClient:
 
     def _read(self, method: str, params: dict[str, Any] | None = None) -> Any:
         """A read-only call. Never triggers an approval prompt."""
+        self._check_gate()
         return self._t.request(method, params)
 
     # -- discovery ---------------------------------------------------------
