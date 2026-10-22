@@ -29,3 +29,16 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -q
+
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The installer edits the user's real config files in place, so the
+      # surgery that removes one entry has to leave the rest alone. These
+      # tests take the functions out of install.ps1 and run them against
+      # strings in memory -- they never touch a real config.
+      - name: Test the installer's config surgery
+        shell: pwsh
+        run: ./tests/test_install_config.ps1
